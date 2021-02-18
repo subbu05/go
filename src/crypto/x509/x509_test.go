@@ -2962,3 +2962,36 @@ func certPoolEqual(a, b *CertPool) bool {
 
 	return true
 }
+
+func TestCertificateRequestRoundtripFields(t *testing.T) {
+	urlA, err := url.Parse("https://example.com/_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlB, err := url.Parse("https://example.org/_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &CertificateRequest{
+		DNSNames:       []string{"example.com", "example.org"},
+		EmailAddresses: []string{"a@example.com", "b@example.com"},
+		IPAddresses:    []net.IP{net.IPv4(192, 0, 2, 0), net.IPv6loopback},
+		URIs:           []*url.URL{urlA, urlB},
+	}
+	out := marshalAndParseCSR(t, in)
+
+	if !reflect.DeepEqual(in.DNSNames, out.DNSNames) {
+		t.Fatalf("Unexpected DNSNames: got %v, want %v", out.DNSNames, in.DNSNames)
+	}
+	if !reflect.DeepEqual(in.EmailAddresses, out.EmailAddresses) {
+		t.Fatalf("Unexpected EmailAddresses: got %v, want %v", out.EmailAddresses, in.EmailAddresses)
+	}
+	if len(in.IPAddresses) != len(out.IPAddresses) ||
+		!in.IPAddresses[0].Equal(out.IPAddresses[0]) ||
+		!in.IPAddresses[1].Equal(out.IPAddresses[1]) {
+		t.Fatalf("Unexpected IPAddresses: got %v, want %v", out.IPAddresses, in.IPAddresses)
+	}
+	if !reflect.DeepEqual(in.URIs, out.URIs) {
+		t.Fatalf("Unexpected URIs: got %v, want %v", out.URIs, in.URIs)
+	}
+}
