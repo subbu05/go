@@ -29,6 +29,7 @@ import (
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/go/internal/lockedfile"
+	"cmd/go/internal/search"
 	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
 	"cmd/go/internal/work"
@@ -117,8 +118,8 @@ elapsed time in the summary line.
 
 The rule for a match in the cache is that the run involves the same
 test binary and the flags on the command line come entirely from a
-restricted set of 'cacheable' test flags, defined as -cpu, -list,
--parallel, -run, -short, and -v. If a run of go test has any test
+restricted set of 'cacheable' test flags, defined as -benchtime, -cpu,
+-list, -parallel, -run, -short, and -v. If a run of go test has any test
 or non-test flags outside this set, the result is not cached. To
 disable test caching, use any test flag or argument other than the
 cacheable flags. The idiomatic way to disable test caching explicitly
@@ -713,6 +714,12 @@ func runTest(ctx context.Context, cmd *base.Command, args []string) {
 					matched[i] = true
 					haveMatch = true
 				}
+			}
+
+			// A package which only has test files can't be imported
+			// as a dependency, nor can it be instrumented for coverage.
+			if len(p.GoFiles)+len(p.CgoFiles) == 0 {
+				continue
 			}
 
 			// Silently ignore attempts to run coverage on
@@ -1326,7 +1333,8 @@ func (c *runCache) tryCacheWithID(b *work.Builder, a *work.Action, id string) bo
 			return false
 		}
 		switch arg[:i] {
-		case "-test.cpu",
+		case "-test.benchtime",
+			"-test.cpu",
 			"-test.list",
 			"-test.parallel",
 			"-test.run",
@@ -1499,7 +1507,7 @@ func computeTestInputsID(a *work.Action, testlog []byte) (cache.ActionID, error)
 			if !filepath.IsAbs(name) {
 				name = filepath.Join(pwd, name)
 			}
-			if a.Package.Root == "" || !inDir(name, a.Package.Root) {
+			if a.Package.Root == "" || search.InDir(name, a.Package.Root) == "" {
 				// Do not recheck files outside the module, GOPATH, or GOROOT root.
 				break
 			}
@@ -1508,7 +1516,7 @@ func computeTestInputsID(a *work.Action, testlog []byte) (cache.ActionID, error)
 			if !filepath.IsAbs(name) {
 				name = filepath.Join(pwd, name)
 			}
-			if a.Package.Root == "" || !inDir(name, a.Package.Root) {
+			if a.Package.Root == "" || search.InDir(name, a.Package.Root) == "" {
 				// Do not recheck files outside the module, GOPATH, or GOROOT root.
 				break
 			}
@@ -1524,18 +1532,6 @@ func computeTestInputsID(a *work.Action, testlog []byte) (cache.ActionID, error)
 	}
 	sum := h.Sum()
 	return sum, nil
-}
-
-func inDir(path, dir string) bool {
-	if str.HasFilePathPrefix(path, dir) {
-		return true
-	}
-	xpath, err1 := filepath.EvalSymlinks(path)
-	xdir, err2 := filepath.EvalSymlinks(dir)
-	if err1 == nil && err2 == nil && str.HasFilePathPrefix(xpath, xdir) {
-		return true
-	}
-	return false
 }
 
 func hashGetenv(name string) cache.ActionID {

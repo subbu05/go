@@ -32,8 +32,7 @@ build A:       A B1 C2 D4 E2 F1
 upgrade* A:    A B1 C4 D5 E2 F1 G1
 upgrade A C4:  A B1 C4 D4 E2 F1 G1
 build A2:     A2 B1 C4 D4 E2 F1 G1
-# BUG: selected versions E2 and F1 are not preserved.
-downgrade A2 D2: A2 C4 D2
+downgrade A2 D2: A2 C4 D2 E2 F1 G1
 
 name: trim
 A: B1 C2
@@ -216,8 +215,7 @@ A: B2
 B1: C1
 B2: C2
 build A:        A B2 C2
-# BUG: build list from downgrade omits selected version C1.
-downgrade A C1: A B1
+downgrade A C1: A B1 C1
 
 name: down2
 A: B2 E2
@@ -231,9 +229,7 @@ E2: D2
 E1:
 F1:
 build A:        A B2 C2 D2 E2 F2
-# BUG: selected versions C1 and D1 are not preserved, and
-# requested version F1 is not selected.
-downgrade A F1: A B1 E1
+downgrade A F1: A B1 C1 D1 E1 F1
 
 # https://research.swtch.com/vgo-mvs#algorithm_4:
 # “[D]owngrades are constrained to only downgrade packages, not also upgrade
@@ -252,8 +248,7 @@ C2:
 D1:
 D2:
 build A:        A B2 C1 D2
-# BUG: requested version D1 is not selected.
-downgrade A D1: A
+downgrade A D1: A       D1
 
 # https://research.swtch.com/vgo-mvs#algorithm_4:
 # “Unlike upgrades, downgrades must work by removing requirements, not adding
@@ -270,10 +265,8 @@ B2: D2
 C1:
 D1:
 D2:
-build A:        A B2 D2
-# BUG: requested version D1 is not selected,
-# and selected version C1 is omitted from the returned build list.
-downgrade A D1: A B1
+build A:        A B2    D2
+downgrade A D1: A B1 C1 D1
 
 name: downcycle
 A: A B2
@@ -281,6 +274,60 @@ B2: A
 B1:
 build A:        A B2
 downgrade A B1: A B1
+
+# Both B3 and C2 require D2.
+# If we downgrade D to D1, then in isolation B3 would downgrade to B1,
+# because B2 is hidden — B1 is the next-highest version that is not hidden.
+# However, if we downgrade D, we will also downgrade C to C1.
+# And C1 requires B2.hidden, and B2.hidden also meets our requirements:
+# it is compatible with D1 and a strict downgrade from B3.
+#
+# Since neither the initial nor the final build list includes B1,
+# and the nothing in the final downgraded build list requires E at all,
+# no dependency on E1 (required by only B1) should be introduced.
+#
+name: downhiddenartifact
+A: B3 C2
+A1: B3
+B1: E1
+B2.hidden:
+B3: D2
+C1: B2.hidden
+C2: D2
+D1:
+D2:
+build A1: A1 B3 D2
+downgrade A1 D1: A1 B1 D1 E1
+build A: A B3 C2 D2
+downgrade A D1: A B2.hidden C1 D1
+
+# Both B3 and C3 require D2.
+# If we downgrade D to D1, then in isolation B3 would downgrade to B1,
+# and C3 would downgrade to C1.
+# But C1 requires B2.hidden, and B1 requires C2.hidden, so we can't
+# downgrade to either of those without pulling the other back up a little.
+#
+# B2.hidden and C2.hidden are both compatible with D1, so that still
+# meets our requirements — but then we're in an odd state in which
+# B and C have both been downgraded to hidden versions, without any
+# remaining requirements to explain how those hidden versions got there.
+#
+# TODO(bcmills): Would it be better to force downgrades to land on non-hidden
+# versions?
+# In this case, that would remove the dependencies on B and C entirely.
+#
+name: downhiddencross
+A: B3 C3
+B1: C2.hidden
+B2.hidden:
+B3: D2
+C1: B2.hidden
+C2.hidden:
+C3: D2
+D1:
+D2:
+build A: A B3 C3 D2
+downgrade A D1: A B2.hidden C2.hidden D1
 
 # golang.org/issue/25542.
 name: noprev1

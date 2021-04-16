@@ -48,6 +48,12 @@ type Node interface {
 	SetEsc(x uint16)
 	Diag() bool
 	SetDiag(x bool)
+
+	// Typecheck values:
+	//  0 means the node is not typechecked
+	//  1 means the node is completely typechecked
+	//  2 means typechecking of the node is in progress
+	//  3 means the node has its type from types2, but may need transformation
 	Typecheck() uint8
 	SetTypecheck(x uint8)
 	NonNil() bool
@@ -278,6 +284,7 @@ const (
 	// OTYPESW:  Left := Right.(type) (appears as .Left of OSWITCH)
 	//   Left is nil if there is no type-switch variable
 	OTYPESW
+	OFUNCINST // instantiation of a generic function
 
 	// types
 	OTCHAN   // chan int
@@ -454,7 +461,7 @@ const (
 	// Go command pragmas
 	GoBuildPragma
 
-	RegisterParams // TODO remove after register abi is working
+	RegisterParams // TODO(register args) remove after register abi is working
 
 )
 

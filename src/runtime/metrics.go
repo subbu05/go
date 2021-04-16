@@ -364,7 +364,7 @@ func (a *sysStatsAggregate) compute() {
 	a.buckHashSys = memstats.buckhash_sys.load()
 	a.gcMiscSys = memstats.gcMiscSys.load()
 	a.otherSys = memstats.other_sys.load()
-	a.heapGoal = atomic.Load64(&memstats.next_gc)
+	a.heapGoal = atomic.Load64(&gcController.heapGoal)
 	a.gcCyclesDone = uint64(memstats.numgc)
 	a.gcCyclesForced = uint64(memstats.numforcedgc)
 
@@ -481,7 +481,7 @@ func readMetrics(samplesp unsafe.Pointer, len int, cap int) {
 
 	// Acquire the metricsSema but with handoff. This operation
 	// is expensive enough that queueing up goroutines and handing
-	// off between them will be noticably better-behaved.
+	// off between them will be noticeably better-behaved.
 	semacquire1(&metricsSema, true, 0, 0)
 
 	// Ensure the map is initialized.

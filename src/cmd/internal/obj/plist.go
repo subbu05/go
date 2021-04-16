@@ -85,6 +85,13 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string
 			// wrapper function
 			continue
 		}
+		// The current args_stackmap generation in the compiler assumes
+		// that the function in question is ABI0, so avoid introducing
+		// an args_stackmap reference if the func is not ABI0 (better to
+		// have no stackmap than an incorrect/lying stackmap).
+		if s.ABI() != ABI0 {
+			continue
+		}
 		found := false
 		for p := s.Func().Text; p != nil; p = p.Link {
 			if p.As == AFUNCDATA && p.From.Type == TYPE_CONST && p.From.Offset == objabi.FUNCDATA_ArgsPointerMaps {
@@ -92,7 +99,6 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string
 				break
 			}
 		}
-
 		if !found {
 			p := Appendp(s.Func().Text, newprog)
 			p.As = AFUNCDATA
@@ -107,6 +113,9 @@ func Flushplist(ctxt *Link, plist *Plist, newprog ProgAlloc, myimportpath string
 	// Turn functions into machine code images.
 	for _, s := range text {
 		mkfwd(s)
+		if ctxt.Arch.ErrorCheck != nil {
+			ctxt.Arch.ErrorCheck(ctxt, s)
+		}
 		linkpatch(ctxt, s, newprog)
 		ctxt.Arch.Preprocess(ctxt, s, newprog)
 		ctxt.Arch.Assemble(ctxt, s, newprog)
@@ -133,7 +142,8 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 		ctxt.Diag("symbol %s listed multiple times", s.Name)
 	}
 	name := strings.Replace(s.Name, "\"\"", ctxt.Pkgpath, -1)
-	s.Func().FuncID = objabi.GetFuncID(name, flag&WRAPPER != 0)
+	s.Func().FuncID = objabi.GetFuncID(name, flag&WRAPPER != 0 || flag&ABIWRAPPER != 0)
+	s.Func().FuncFlag = toFuncFlag(flag)
 	s.Set(AttrOnList, true)
 	s.Set(AttrDuplicateOK, flag&DUPOK != 0)
 	s.Set(AttrNoSplit, flag&NOSPLIT != 0)
@@ -142,12 +152,19 @@ func (ctxt *Link) InitTextSym(s *LSym, flag int) {
 	s.Set(AttrABIWrapper, flag&ABIWRAPPER != 0)
 	s.Set(AttrNeedCtxt, flag&NEEDCTXT != 0)
 	s.Set(AttrNoFrame, flag&NOFRAME != 0)
-	s.Set(AttrTopFrame, flag&TOPFRAME != 0)
 	s.Type = objabi.STEXT
 	ctxt.Text = append(ctxt.Text, s)
 
 	// Set up DWARF entries for s
 	ctxt.dwarfSym(s)
+}
+
+func toFuncFlag(flag int) objabi.FuncFlag {
+	var out objabi.FuncFlag
+	if flag&TOPFRAME != 0 {
+		out |= objabi.FuncFlag_TOPFRAME
+	}
+	return out
 }
 
 func (ctxt *Link) Globl(s *LSym, size int64, flag int) {

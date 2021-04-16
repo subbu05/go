@@ -8,7 +8,7 @@
 #include "funcdata.h"
 #include "textflag.h"
 
-TEXT runtime·rt0_go(SB),NOSPLIT,$0
+TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	// SP = stack; R0 = argc; R1 = argv
 
 	SUB	$32, RSP
@@ -73,6 +73,10 @@ nocgo:
 
 	BL	runtime·check(SB)
 
+#ifdef GOOS_windows
+	BL	runtime·wintls(SB)
+#endif
+
 	MOVW	8(RSP), R0	// copy argc
 	MOVW	R0, -8(RSP)
 	MOVD	16(RSP), R0		// copy argv
@@ -109,18 +113,26 @@ TEXT runtime·breakpoint(SB),NOSPLIT|NOFRAME,$0-0
 TEXT runtime·asminit(SB),NOSPLIT|NOFRAME,$0-0
 	RET
 
+TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME,$0
+	BL	runtime·mstart0(SB)
+	RET // not reached
+
 /*
  *  go-routine
  */
 
 // void gogo(Gobuf*)
 // restore state from Gobuf; longjmp
-TEXT runtime·gogo(SB), NOSPLIT, $24-8
+TEXT runtime·gogo(SB), NOSPLIT|NOFRAME, $0-8
 	MOVD	buf+0(FP), R5
-	MOVD	gobuf_g(R5), g
+	MOVD	gobuf_g(R5), R6
+	MOVD	0(R6), R4	// make sure g != nil
+	B	gogo<>(SB)
+
+TEXT gogo<>(SB), NOSPLIT|NOFRAME, $0
+	MOVD	R6, g
 	BL	runtime·save_g(SB)
 
-	MOVD	0(g), R4	// make sure g is not nil
 	MOVD	gobuf_sp(R5), R0
 	MOVD	R0, RSP
 	MOVD	gobuf_bp(R5), R29
@@ -147,7 +159,6 @@ TEXT runtime·mcall(SB), NOSPLIT|NOFRAME, $0-8
 	MOVD	R29, (g_sched+gobuf_bp)(g)
 	MOVD	LR, (g_sched+gobuf_pc)(g)
 	MOVD	$0, (g_sched+gobuf_lr)(g)
-	MOVD	g, (g_sched+gobuf_g)(g)
 
 	// Switch to m->g0 & its stack, call fn.
 	MOVD	g, R3
@@ -205,24 +216,12 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 switch:
 	// save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
-	MOVD	$runtime·systemstack_switch(SB), R6
-	ADD	$8, R6	// get past prologue
-	MOVD	R6, (g_sched+gobuf_pc)(g)
-	MOVD	RSP, R0
-	MOVD	R0, (g_sched+gobuf_sp)(g)
-	MOVD	R29, (g_sched+gobuf_bp)(g)
-	MOVD	$0, (g_sched+gobuf_lr)(g)
-	MOVD	g, (g_sched+gobuf_g)(g)
+	BL	gosave_systemstack_switch<>(SB)
 
 	// switch to g0
 	MOVD	R5, g
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R3
-	// make it look like mstart called systemstack on g0, to stop traceback
-	SUB	$16, R3
-	AND	$~15, R3
-	MOVD	$runtime·mstart(SB), R4
-	MOVD	R4, 0(R3)
 	MOVD	R3, RSP
 	MOVD	(g_sched+gobuf_bp)(g), R29
 
@@ -859,9 +858,15 @@ TEXT runtime·jmpdefer(SB), NOSPLIT|NOFRAME, $0-16
 	MOVD	0(R26), R3
 	B	(R3)
 
-// Save state of caller into g->sched. Smashes R0.
-TEXT gosave<>(SB),NOSPLIT|NOFRAME,$0
-	MOVD	LR, (g_sched+gobuf_pc)(g)
+// Save state of caller into g->sched,
+// but using fake PC from systemstack_switch.
+// Must only be called from functions with no locals ($0)
+// or else unwinding from systemstack_switch is incorrect.
+// Smashes R0.
+TEXT gosave_systemstack_switch<>(SB),NOSPLIT|NOFRAME,$0
+	MOVD	$runtime·systemstack_switch(SB), R0
+	ADD	$8, R0	// get past prologue
+	MOVD	R0, (g_sched+gobuf_pc)(g)
 	MOVD	RSP, R0
 	MOVD	R0, (g_sched+gobuf_sp)(g)
 	MOVD	R29, (g_sched+gobuf_bp)(g)
@@ -870,7 +875,18 @@ TEXT gosave<>(SB),NOSPLIT|NOFRAME,$0
 	// Assert ctxt is zero. See func save.
 	MOVD	(g_sched+gobuf_ctxt)(g), R0
 	CBZ	R0, 2(PC)
-	CALL	runtime·badctxt(SB)
+	CALL	runtime·abort(SB)
+	RET
+
+// func asmcgocall_no_g(fn, arg unsafe.Pointer)
+// Call fn(arg) aligned appropriately for the gcc ABI.
+// Called on a system stack, and there may be no g yet (during needm).
+TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
+	MOVD	fn+0(FP), R1
+	MOVD	arg+8(FP), R0
+	SUB	$16, RSP	// skip over saved frame pointer below RSP
+	BL	(R1)
+	ADD	$16, RSP	// skip over saved frame pointer below RSP
 	RET
 
 // func asmcgocall(fn, arg unsafe.Pointer) int32
@@ -897,8 +913,8 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-20
 	BEQ	nosave
 
 	// Switch to system stack.
-	MOVD	R0, R9	// gosave<> and save_g might clobber R0
-	BL	gosave<>(SB)
+	MOVD	R0, R9	// gosave_systemstack_switch<> and save_g might clobber R0
+	BL	gosave_systemstack_switch<>(SB)
 	MOVD	R3, g
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R0
@@ -951,7 +967,7 @@ nosave:
 	BL	(R1)
 	// Restore stack pointer.
 	MOVD	8(RSP), R2
-	MOVD	R2, RSP	
+	MOVD	R2, RSP
 	MOVD	R0, ret+16(FP)
 	RET
 
@@ -1099,6 +1115,9 @@ TEXT setg_gcc<>(SB),NOSPLIT,$8
 	MOVD	savedR27-8(SP), R27
 	RET
 
+TEXT runtime·emptyfunc(SB),0,$0-0
+	RET
+
 TEXT runtime·abort(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	ZR, R0
 	MOVD	(R0), R0
@@ -1139,10 +1158,10 @@ TEXT ·checkASM(SB),NOSPLIT,$0-1
 // It does not clobber any general-purpose registers,
 // but may clobber others (e.g., floating point registers)
 // The act of CALLing gcWriteBarrier will clobber R30 (LR).
-TEXT runtime·gcWriteBarrier(SB),NOSPLIT,$216
+TEXT runtime·gcWriteBarrier(SB),NOSPLIT,$200
 	// Save the registers clobbered by the fast path.
-	MOVD	R0, 200(RSP)
-	MOVD	R1, 208(RSP)
+	MOVD	R0, 184(RSP)
+	MOVD	R1, 192(RSP)
 	MOVD	g_m(g), R0
 	MOVD	m_p(R0), R0
 	MOVD	(p_wbBuf+wbBuf_next)(R0), R1
@@ -1158,8 +1177,8 @@ TEXT runtime·gcWriteBarrier(SB),NOSPLIT,$216
 	// Is the buffer full? (flags set in CMP above)
 	BEQ	flush
 ret:
-	MOVD	200(RSP), R0
-	MOVD	208(RSP), R1
+	MOVD	184(RSP), R0
+	MOVD	192(RSP), R1
 	// Do the write.
 	MOVD	R3, (R2)
 	RET
@@ -1183,17 +1202,16 @@ flush:
 	MOVD	R13, 96(RSP)
 	MOVD	R14, 104(RSP)
 	MOVD	R15, 112(RSP)
-	MOVD	R16, 120(RSP)
-	MOVD	R17, 128(RSP)
+	// R16, R17 may be clobbered by linker trampoline
 	// R18 is unused.
-	MOVD	R19, 136(RSP)
-	MOVD	R20, 144(RSP)
-	MOVD	R21, 152(RSP)
-	MOVD	R22, 160(RSP)
-	MOVD	R23, 168(RSP)
-	MOVD	R24, 176(RSP)
-	MOVD	R25, 184(RSP)
-	MOVD	R26, 192(RSP)
+	MOVD	R19, 120(RSP)
+	MOVD	R20, 128(RSP)
+	MOVD	R21, 136(RSP)
+	MOVD	R22, 144(RSP)
+	MOVD	R23, 152(RSP)
+	MOVD	R24, 160(RSP)
+	MOVD	R25, 168(RSP)
+	MOVD	R26, 176(RSP)
 	// R27 is temp register.
 	// R28 is g.
 	// R29 is frame pointer (unused).
@@ -1217,16 +1235,14 @@ flush:
 	MOVD	96(RSP), R13
 	MOVD	104(RSP), R14
 	MOVD	112(RSP), R15
-	MOVD	120(RSP), R16
-	MOVD	128(RSP), R17
-	MOVD	136(RSP), R19
-	MOVD	144(RSP), R20
-	MOVD	152(RSP), R21
-	MOVD	160(RSP), R22
-	MOVD	168(RSP), R23
-	MOVD	176(RSP), R24
-	MOVD	184(RSP), R25
-	MOVD	192(RSP), R26
+	MOVD	120(RSP), R19
+	MOVD	128(RSP), R20
+	MOVD	136(RSP), R21
+	MOVD	144(RSP), R22
+	MOVD	152(RSP), R23
+	MOVD	160(RSP), R24
+	MOVD	168(RSP), R25
+	MOVD	176(RSP), R26
 	JMP	ret
 
 // Note: these functions use a special calling convention to save generated code space.

@@ -51,30 +51,14 @@ type Reloc struct {
 	*goobj.Reloc
 	r *oReader
 	l *Loader
-
-	// External reloc types may not fit into a uint8 which the Go object file uses.
-	// Store it here, instead of in the byte of goobj.Reloc.
-	// For Go symbols this will always be zero.
-	// goobj.Reloc.Type() + typ is always the right type, for both Go and external
-	// symbols.
-	typ objabi.RelocType
 }
 
-func (rel Reloc) Type() objabi.RelocType { return objabi.RelocType(rel.Reloc.Type()) + rel.typ }
-func (rel Reloc) Sym() Sym               { return rel.l.resolve(rel.r, rel.Reloc.Sym()) }
-func (rel Reloc) SetSym(s Sym)           { rel.Reloc.SetSym(goobj.SymRef{PkgIdx: 0, SymIdx: uint32(s)}) }
-func (rel Reloc) IsMarker() bool         { return rel.Siz() == 0 }
-
-func (rel Reloc) SetType(t objabi.RelocType) {
-	if t != objabi.RelocType(uint8(t)) {
-		panic("SetType: type doesn't fit into Reloc")
-	}
-	rel.Reloc.SetType(uint8(t))
-	if rel.typ != 0 {
-		// should use SymbolBuilder.SetRelocType
-		panic("wrong method to set reloc type")
-	}
-}
+func (rel Reloc) Type() objabi.RelocType     { return objabi.RelocType(rel.Reloc.Type()) &^ objabi.R_WEAK }
+func (rel Reloc) Weak() bool                 { return objabi.RelocType(rel.Reloc.Type())&objabi.R_WEAK != 0 }
+func (rel Reloc) SetType(t objabi.RelocType) { rel.Reloc.SetType(uint16(t)) }
+func (rel Reloc) Sym() Sym                   { return rel.l.resolve(rel.r, rel.Reloc.Sym()) }
+func (rel Reloc) SetSym(s Sym)               { rel.Reloc.SetSym(goobj.SymRef{PkgIdx: 0, SymIdx: uint32(s)}) }
+func (rel Reloc) IsMarker() bool             { return rel.Siz() == 0 }
 
 // Aux holds a "handle" to access an aux symbol record from an
 // object file.
@@ -241,7 +225,6 @@ type Loader struct {
 	attrExternal         Bitmap // external symbols, indexed by ext sym index
 
 	attrReadOnly         map[Sym]bool     // readonly data for this sym
-	attrTopFrame         map[Sym]struct{} // top frame symbols
 	attrSpecial          map[Sym]struct{} // "special" frame symbols
 	attrCgoExportDynamic map[Sym]struct{} // "cgo_export_dynamic" symbols
 	attrCgoExportStatic  map[Sym]struct{} // "cgo_export_static" symbols
@@ -273,6 +256,9 @@ type Loader struct {
 	// field tracking is enabled. Reachparent[K] contains the index of
 	// the symbol that triggered the marking of symbol K as live.
 	Reachparent []Sym
+
+	// CgoExports records cgo-exported symbols by SymName.
+	CgoExports map[string]Sym
 
 	flags uint32
 
@@ -308,15 +294,14 @@ type elfsetstringFunc func(str string, off int)
 // extSymPayload holds the payload (data + relocations) for linker-synthesized
 // external symbols (note that symbol value is stored in a separate slice).
 type extSymPayload struct {
-	name     string // TODO: would this be better as offset into str table?
-	size     int64
-	ver      int
-	kind     sym.SymKind
-	objidx   uint32 // index of original object if sym made by cloneToExternal
-	relocs   []goobj.Reloc
-	reltypes []objabi.RelocType // relocation types
-	data     []byte
-	auxs     []goobj.Aux
+	name   string // TODO: would this be better as offset into str table?
+	size   int64
+	ver    int
+	kind   sym.SymKind
+	objidx uint32 // index of original object if sym made by cloneToExternal
+	relocs []goobj.Reloc
+	data   []byte
+	auxs   []goobj.Aux
 }
 
 const (
@@ -349,7 +334,6 @@ func NewLoader(flags uint32, elfsetstring elfsetstringFunc, reporter *ErrorRepor
 		plt:                  make(map[Sym]int32),
 		got:                  make(map[Sym]int32),
 		dynid:                make(map[Sym]int32),
-		attrTopFrame:         make(map[Sym]struct{}),
 		attrSpecial:          make(map[Sym]struct{}),
 		attrCgoExportDynamic: make(map[Sym]struct{}),
 		attrCgoExportStatic:  make(map[Sym]struct{}),
@@ -531,6 +515,36 @@ func (l *Loader) LookupOrCreateSym(name string, ver int) Sym {
 		l.symsByName[ver][name] = i
 	}
 	return i
+}
+
+// AddCgoExport records a cgo-exported symbol in l.CgoExports.
+// This table is used to identify the correct Go symbol ABI to use
+// to resolve references from host objects (which don't have ABIs).
+func (l *Loader) AddCgoExport(s Sym) {
+	if l.CgoExports == nil {
+		l.CgoExports = make(map[string]Sym)
+	}
+	l.CgoExports[l.SymName(s)] = s
+}
+
+// LookupOrCreateCgoExport is like LookupOrCreateSym, but if ver
+// indicates a global symbol, it uses the CgoExport table to determine
+// the appropriate symbol version (ABI) to use. ver must be either 0
+// or a static symbol version.
+func (l *Loader) LookupOrCreateCgoExport(name string, ver int) Sym {
+	if ver >= sym.SymVerStatic {
+		return l.LookupOrCreateSym(name, ver)
+	}
+	if ver != 0 {
+		panic("ver must be 0 or a static version")
+	}
+	// Look for a cgo-exported symbol from Go.
+	if s, ok := l.CgoExports[name]; ok {
+		return s
+	}
+	// Otherwise, this must just be a symbol in the host object.
+	// Create a version 0 symbol for it.
+	return l.LookupOrCreateSym(name, 0)
 }
 
 func (l *Loader) IsExternal(i Sym) bool {
@@ -1006,24 +1020,6 @@ func (l *Loader) SetAttrExternal(i Sym, v bool) {
 		l.attrExternal.Set(l.extIndex(i))
 	} else {
 		l.attrExternal.Unset(l.extIndex(i))
-	}
-}
-
-// AttrTopFrame returns true for a function symbol that is an entry
-// point, meaning that unwinders should stop when they hit this
-// function.
-func (l *Loader) AttrTopFrame(i Sym) bool {
-	_, ok := l.attrTopFrame[i]
-	return ok
-}
-
-// SetAttrTopFrame sets the "top frame" property for a symbol (see
-// AttrTopFrame).
-func (l *Loader) SetAttrTopFrame(i Sym, v bool) {
-	if v {
-		l.attrTopFrame[i] = struct{}{}
-	} else {
-		delete(l.attrTopFrame, i)
 	}
 }
 
@@ -1567,7 +1563,7 @@ func (l *Loader) SymUnit(i Sym) *sym.CompilationUnit {
 // regular compiler-generated Go symbols), but in the case of
 // building with "-linkshared" (when a symbol is read from a
 // shared library), will hold the library name.
-// NOTE: this correspondes to sym.Symbol.File field.
+// NOTE: this corresponds to sym.Symbol.File field.
 func (l *Loader) SymPkg(i Sym) string {
 	if f, ok := l.symPkg[i]; ok {
 		return f
@@ -1853,10 +1849,9 @@ func (relocs *Relocs) Count() int { return len(relocs.rs) }
 // At returns the j-th reloc for a global symbol.
 func (relocs *Relocs) At(j int) Reloc {
 	if relocs.l.isExtReader(relocs.r) {
-		pp := relocs.l.payloads[relocs.li]
-		return Reloc{&relocs.rs[j], relocs.r, relocs.l, pp.reltypes[j]}
+		return Reloc{&relocs.rs[j], relocs.r, relocs.l}
 	}
-	return Reloc{&relocs.rs[j], relocs.r, relocs.l, 0}
+	return Reloc{&relocs.rs[j], relocs.r, relocs.l}
 }
 
 // Relocs returns a Relocs object for the given global sym.
@@ -1905,7 +1900,11 @@ func (fi *FuncInfo) Locals() int {
 }
 
 func (fi *FuncInfo) FuncID() objabi.FuncID {
-	return objabi.FuncID((*goobj.FuncInfo)(nil).ReadFuncID(fi.data))
+	return (*goobj.FuncInfo)(nil).ReadFuncID(fi.data)
+}
+
+func (fi *FuncInfo) FuncFlag() objabi.FuncFlag {
+	return (*goobj.FuncInfo)(nil).ReadFuncFlag(fi.data)
 }
 
 func (fi *FuncInfo) Pcsp() Sym {
@@ -1990,6 +1989,13 @@ func (fi *FuncInfo) File(k int) goobj.CUFileIndex {
 		panic("need to call Preload first")
 	}
 	return (*goobj.FuncInfo)(nil).ReadFile(fi.data, fi.lengths.FileOff, uint32(k))
+}
+
+// TopFrame returns true if the function associated with this FuncInfo
+// is an entry point, meaning that unwinders should stop when they hit
+// this function.
+func (fi *FuncInfo) TopFrame() bool {
+	return (fi.FuncFlag() & objabi.FuncFlag_TOPFRAME) != 0
 }
 
 type InlTreeNode struct {
@@ -2151,9 +2157,6 @@ func (st *loadState) preloadSyms(r *oReader, kind int) {
 		}
 		gi := st.addSym(name, v, r, i, kind, osym)
 		r.syms[i] = gi
-		if osym.TopFrame() {
-			l.SetAttrTopFrame(gi, true)
-		}
 		if osym.Local() {
 			l.SetAttrLocal(gi, true)
 		}
@@ -2238,7 +2241,7 @@ func loadObjRefs(l *Loader, r *oReader, arch *sys.Arch) {
 		pkg := r.Pkg(i)
 		objidx, ok := l.objByPkg[pkg]
 		if !ok {
-			log.Fatalf("reference of nonexisted package %s, from %v", pkg, r.unit.Lib)
+			log.Fatalf("%v: reference to nonexistent package %s", r.unit.Lib, pkg)
 		}
 		r.pkg[i] = objidx
 	}
@@ -2349,13 +2352,11 @@ func (l *Loader) cloneToExternal(symIdx Sym) {
 		// Copy relocations
 		relocs := l.Relocs(symIdx)
 		pp.relocs = make([]goobj.Reloc, relocs.Count())
-		pp.reltypes = make([]objabi.RelocType, relocs.Count())
 		for i := range pp.relocs {
 			// Copy the relocs slice.
 			// Convert local reference to global reference.
 			rel := relocs.At(i)
-			pp.relocs[i].Set(rel.Off(), rel.Siz(), 0, rel.Add(), goobj.SymRef{PkgIdx: 0, SymIdx: uint32(rel.Sym())})
-			pp.reltypes[i] = rel.Type()
+			pp.relocs[i].Set(rel.Off(), rel.Siz(), uint16(rel.Type()), rel.Add(), goobj.SymRef{PkgIdx: 0, SymIdx: uint32(rel.Sym())})
 		}
 
 		// Copy data
@@ -2411,7 +2412,6 @@ func (l *Loader) CopyAttributes(src Sym, dst Sym) {
 		// when copying attributes from a dupOK ABI wrapper symbol to
 		// the real target symbol (which may not be marked dupOK).
 	}
-	l.SetAttrTopFrame(dst, l.AttrTopFrame(src))
 	l.SetAttrSpecial(dst, l.AttrSpecial(src))
 	l.SetAttrCgoExportDynamic(dst, l.AttrCgoExportDynamic(src))
 	l.SetAttrCgoExportStatic(dst, l.AttrCgoExportStatic(src))
@@ -2571,7 +2571,7 @@ func (l *Loader) AssignTextSymbolOrder(libs []*sym.Library, intlibs []bool, exts
 			for i, list := range lists {
 				for _, s := range list {
 					sym := Sym(s)
-					if l.attrReachable.Has(sym) && !assignedToUnit.Has(sym) {
+					if !assignedToUnit.Has(sym) {
 						textp = append(textp, sym)
 						unit := l.SymUnit(sym)
 						if unit != nil {

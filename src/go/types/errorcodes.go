@@ -159,7 +159,7 @@ const (
 	_UntypedNil
 
 	// _WrongAssignCount occurs when the number of values on the right-hand side
-	// of an assignment or or initialization expression does not match the number
+	// of an assignment or initialization expression does not match the number
 	// of variables on the left-hand side.
 	//
 	// Example:
@@ -756,51 +756,11 @@ const (
 	_NonVariadicDotDotDot
 
 	// _MisplacedDotDotDot occurs when a "..." is used somewhere other than the
-	// final argument to a function call.
+	// final argument in a function declaration.
 	//
 	// Example:
-	//  func printArgs(args ...int) {
-	//  	for _, a := range args {
-	//  		println(a)
-	//  	}
-	//  }
-	//
-	//  func f() {
-	//  	a := []int{1,2,3}
-	//  	printArgs(0, a...)
-	//  }
+	// 	func f(...int, int)
 	_MisplacedDotDotDot
-
-	// _InvalidDotDotDotOperand occurs when a "..." operator is applied to a
-	// single-valued operand.
-	//
-	// Example:
-	//  func printArgs(args ...int) {
-	//  	for _, a := range args {
-	//  		println(a)
-	//  	}
-	//  }
-	//
-	//  func f() {
-	//  	a := 1
-	//  	printArgs(a...)
-	//  }
-	//
-	// Example:
-	//  func args() (int, int) {
-	//  	return 1, 2
-	//  }
-	//
-	//  func printArgs(args ...int) {
-	//  	for _, a := range args {
-	//  		println(a)
-	//  	}
-	//  }
-	//
-	//  func g() {
-	//  	printArgs(args()...)
-	//  }
-	_InvalidDotDotDotOperand
 
 	// _InvalidDotDotDot occurs when a "..." is used in a non-variadic built-in
 	// function.
@@ -1081,18 +1041,6 @@ const (
 	//  }
 	_InvalidPostDecl
 
-	// _InvalidChanRange occurs when a send-only channel used in a range
-	// expression.
-	//
-	// Example:
-	//  func sum(c chan<- int) {
-	//  	s := 0
-	//  	for i := range c {
-	//  		s += i
-	//  	}
-	//  }
-	_InvalidChanRange
-
 	// _InvalidIterVar occurs when two iteration variables are used while ranging
 	// over a channel.
 	//
@@ -1369,4 +1317,8 @@ const (
 
 	// _BadDecl occurs when a declaration has invalid syntax.
 	_BadDecl
+
+	// _Todo is a placeholder for error codes that have not been decided.
+	// TODO(rFindley) remove this error code after deciding on errors for generics code.
+	_Todo
 )

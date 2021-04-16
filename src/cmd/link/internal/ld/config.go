@@ -8,7 +8,6 @@ import (
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"fmt"
-	"log"
 )
 
 // A BuildMode indicates the sort of object we are building.
@@ -36,7 +35,7 @@ func (mode *BuildMode) Set(s string) error {
 		return fmt.Errorf("invalid buildmode: %q", s)
 	case "exe":
 		switch objabi.GOOS + "/" + objabi.GOARCH {
-		case "darwin/arm64", "windows/arm": // On these platforms, everything is PIE
+		case "darwin/arm64", "windows/arm", "windows/arm64": // On these platforms, everything is PIE
 			*mode = BuildModePIE
 		default:
 			*mode = BuildModeExe
@@ -65,7 +64,7 @@ func (mode *BuildMode) Set(s string) error {
 			}
 		case "windows":
 			switch objabi.GOARCH {
-			case "amd64", "386", "arm":
+			case "amd64", "386", "arm", "arm64":
 			default:
 				return badmode()
 			}
@@ -181,7 +180,7 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 	if ctxt.Debugvlog > 1 {
 		defer func() {
 			if res {
-				log.Printf("external linking is forced by: %s\n", reason)
+				ctxt.Logf("external linking is forced by: %s\n", reason)
 			}
 		}()
 	}
@@ -200,7 +199,10 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 	if iscgo && ctxt.Arch.InFamily(sys.MIPS64, sys.MIPS, sys.PPC64, sys.RISCV64) {
 		return true, objabi.GOARCH + " does not support internal cgo"
 	}
-	if iscgo && objabi.GOOS == "android" {
+	if iscgo && (objabi.GOOS == "android" || objabi.GOOS == "dragonfly") {
+		// It seems that on Dragonfly thread local storage is
+		// set up by the dynamic linker, so internal cgo linking
+		// doesn't work. Test case is "go test runtime/cgo".
 		return true, objabi.GOOS + " does not support internal cgo"
 	}
 
@@ -220,7 +222,7 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 	case BuildModePIE:
 		switch objabi.GOOS + "/" + objabi.GOARCH {
 		case "linux/amd64", "linux/arm64", "android/arm64":
-		case "windows/386", "windows/amd64", "windows/arm":
+		case "windows/386", "windows/amd64", "windows/arm", "windows/arm64":
 		case "darwin/amd64", "darwin/arm64":
 		default:
 			// Internal linking does not support TLS_IE.

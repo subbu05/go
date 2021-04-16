@@ -309,14 +309,24 @@ var (
 	benchMatches []string
 )
 
-func (t *tester) registerStdTest(pkg string) {
-	testName := "go_test:" + pkg
+func (t *tester) registerStdTest(pkg string, useG3 bool) {
+	heading := "Testing packages."
+	testPrefix := "go_test:"
+	gcflags := gogcflags
+	if useG3 {
+		heading = "Testing packages with -G=3."
+		testPrefix = "go_test_g3:"
+		gcflags += " -G=3"
+	}
+
+	testName := testPrefix + pkg
 	if t.runRx == nil || t.runRx.MatchString(testName) == t.runRxWant {
 		stdMatches = append(stdMatches, pkg)
 	}
+
 	t.tests = append(t.tests, distTest{
 		name:    testName,
-		heading: "Testing packages.",
+		heading: heading,
 		fn: func(dt *distTest) error {
 			if ranGoTest {
 				return nil
@@ -343,7 +353,7 @@ func (t *tester) registerStdTest(pkg string) {
 				"-short=" + short(),
 				t.tags(),
 				t.timeout(timeoutSec),
-				"-gcflags=all=" + gogcflags,
+				"-gcflags=all=" + gcflags,
 			}
 			if t.race {
 				args = append(args, "-race")
@@ -408,7 +418,10 @@ func (t *tester) registerTests() {
 	if len(t.runNames) > 0 {
 		for _, name := range t.runNames {
 			if strings.HasPrefix(name, "go_test:") {
-				t.registerStdTest(strings.TrimPrefix(name, "go_test:"))
+				t.registerStdTest(strings.TrimPrefix(name, "go_test:"), false)
+			}
+			if strings.HasPrefix(name, "go_test_g3:") {
+				t.registerStdTest(strings.TrimPrefix(name, "go_test_g3:"), true)
 			}
 			if strings.HasPrefix(name, "go_test_bench:") {
 				t.registerRaceBenchTest(strings.TrimPrefix(name, "go_test_bench:"))
@@ -431,8 +444,15 @@ func (t *tester) registerTests() {
 			fatalf("Error running go list std cmd: %v:\n%s", err, cmd.Stderr)
 		}
 		pkgs := strings.Fields(string(all))
+		if false {
+			// Disable -G=3 option for standard tests for now, since
+			// they are flaky on the builder.
+			for _, pkg := range pkgs {
+				t.registerStdTest(pkg, true /* -G=3 flag */)
+			}
+		}
 		for _, pkg := range pkgs {
-			t.registerStdTest(pkg)
+			t.registerStdTest(pkg, false)
 		}
 		if t.race {
 			for _, pkg := range pkgs {
@@ -450,6 +470,19 @@ func (t *tester) registerTests() {
 			heading: "os/user with tag osusergo",
 			fn: func(dt *distTest) error {
 				t.addCmd(dt, "src", t.goTest(), t.timeout(300), "-tags=osusergo", "os/user")
+				return nil
+			},
+		})
+	}
+
+	// Test go/... cmd/gofmt with type parameters enabled.
+	if !t.compileOnly {
+		t.tests = append(t.tests, distTest{
+			name:    "tyepparams",
+			heading: "go/... and cmd/gofmt tests with tag typeparams",
+			fn: func(dt *distTest) error {
+				t.addCmd(dt, "src", t.goTest(), t.timeout(300), "-tags=typeparams", "go/...")
+				t.addCmd(dt, "src", t.goTest(), t.timeout(300), "-tags=typeparams", "cmd/gofmt")
 				return nil
 			},
 		})
@@ -716,8 +749,9 @@ func (t *tester) registerTests() {
 		if gohostos == "linux" && goarch == "amd64" {
 			t.registerTest("testasan", "../misc/cgo/testasan", "go", "run", ".")
 		}
-		if mSanSupported(goos, goarch) {
-			t.registerHostTest("testsanitizers/msan", "../misc/cgo/testsanitizers", "misc/cgo/testsanitizers", ".")
+		if goos == "linux" {
+			// because syscall.SysProcAttri struct used in misc/cgo/testsanitizers is only built on linux.
+			t.registerHostTest("testsanitizers", "../misc/cgo/testsanitizers", "misc/cgo/testsanitizers", ".")
 		}
 		if t.hasBash() && goos != "android" && !t.iOS() && gohostos != "windows" {
 			t.registerHostTest("cgo_errors", "../misc/cgo/errors", "misc/cgo/errors", ".")
@@ -1613,19 +1647,8 @@ func raceDetectorSupported(goos, goarch string) bool {
 		return goarch == "amd64" || goarch == "ppc64le" || goarch == "arm64"
 	case "darwin":
 		return goarch == "amd64" || goarch == "arm64"
-	case "freebsd", "netbsd", "windows":
+	case "freebsd", "netbsd", "openbsd", "windows":
 		return goarch == "amd64"
-	default:
-		return false
-	}
-}
-
-// mSanSupported is a copy of the function cmd/internal/sys.MSanSupported,
-// which can't be used here because cmd/dist has to be buildable by Go 1.4.
-func mSanSupported(goos, goarch string) bool {
-	switch goos {
-	case "linux":
-		return goarch == "amd64" || goarch == "arm64"
 	default:
 		return false
 	}

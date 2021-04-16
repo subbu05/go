@@ -36,6 +36,7 @@ func testEndToEnd(t *testing.T, goarch, file string) {
 	var ok bool
 	testOut = new(bytes.Buffer) // The assembler writes test output to this buffer.
 	ctxt.Bso = bufio.NewWriter(os.Stdout)
+	ctxt.IsAsm = true
 	defer ctxt.Bso.Flush()
 	failed := false
 	ctxt.DiagFunc = func(format string, args ...interface{}) {
@@ -269,7 +270,7 @@ var (
 	errQuotesRE = regexp.MustCompile(`"([^"]*)"`)
 )
 
-func testErrors(t *testing.T, goarch, file string) {
+func testErrors(t *testing.T, goarch, file string, flags ...string) {
 	input := filepath.Join("testdata", file+".s")
 	architecture, ctxt := setArch(goarch)
 	lexer := lex.NewLexer(input)
@@ -278,6 +279,7 @@ func testErrors(t *testing.T, goarch, file string) {
 	var ok bool
 	testOut = new(bytes.Buffer) // The assembler writes test output to this buffer.
 	ctxt.Bso = bufio.NewWriter(os.Stdout)
+	ctxt.IsAsm = true
 	defer ctxt.Bso.Flush()
 	failed := false
 	var errBuf bytes.Buffer
@@ -289,6 +291,14 @@ func testErrors(t *testing.T, goarch, file string) {
 			s += "\n"
 		}
 		errBuf.WriteString(s)
+	}
+	for _, flag := range flags {
+		switch flag {
+		case "dynlink":
+			ctxt.Flag_dynlink = true
+		default:
+			t.Errorf("unknown flag %s", flag)
+		}
 	}
 	pList.Firstpc, ok = parser.Parse()
 	obj.Flushplist(ctxt, pList, nil, "")
@@ -428,6 +438,10 @@ func TestAMD64Errors(t *testing.T) {
 	testErrors(t, "amd64", "amd64error")
 }
 
+func TestAMD64DynLinkErrors(t *testing.T) {
+	testErrors(t, "amd64", "amd64dynlinkerror", "dynlink")
+}
+
 func TestMIPSEndToEnd(t *testing.T) {
 	testEndToEnd(t, "mips", "mips")
 	testEndToEnd(t, "mips64", "mips64")
@@ -437,8 +451,12 @@ func TestPPC64EndToEnd(t *testing.T) {
 	testEndToEnd(t, "ppc64", "ppc64")
 }
 
-func TestRISCVEncoder(t *testing.T) {
-	testEndToEnd(t, "riscv64", "riscvenc")
+func TestRISCVEndToEnd(t *testing.T) {
+	testEndToEnd(t, "riscv64", "riscv64")
+}
+
+func TestRISCVErrors(t *testing.T) {
+	testErrors(t, "riscv64", "riscv64error")
 }
 
 func TestS390XEndToEnd(t *testing.T) {

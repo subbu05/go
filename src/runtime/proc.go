@@ -5,14 +5,12 @@
 package runtime
 
 import (
-	"internal/bytealg"
 	"internal/cpu"
+	"internal/goexperiment"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
 )
-
-var buildVersion = sys.TheVersion
 
 // set using cmd/go/internal/modload.ModInfoProg
 var modinfo string
@@ -539,6 +537,30 @@ func atomicAllG() (**g, uintptr) {
 // atomicAllGIndex returns ptr[i] with the allgptr returned from atomicAllG.
 func atomicAllGIndex(ptr **g, i uintptr) *g {
 	return *(**g)(add(unsafe.Pointer(ptr), i*sys.PtrSize))
+}
+
+// forEachG calls fn on every G from allgs.
+//
+// forEachG takes a lock to exclude concurrent addition of new Gs.
+func forEachG(fn func(gp *g)) {
+	lock(&allglock)
+	for _, gp := range allgs {
+		fn(gp)
+	}
+	unlock(&allglock)
+}
+
+// forEachGRace calls fn on every G from allgs.
+//
+// forEachGRace avoids locking, but does not exclude addition of new Gs during
+// execution, which may be missed.
+func forEachGRace(fn func(gp *g)) {
+	ptr, length := atomicAllG()
+	for i := uintptr(0); i < length; i++ {
+		gp := atomicAllGIndex(ptr, i)
+		fn(gp)
+	}
+	return
 }
 
 const (
@@ -1234,7 +1256,10 @@ func mStackIsSystemAllocated() bool {
 }
 
 // mstart is the entry-point for new Ms.
-//
+// It is written in assembly, uses ABI0, is marked TOPFRAME, and calls mstart0.
+func mstart()
+
+// mstart0 is the Go entry-point for new Ms.
 // This must not split the stack because we may not even have stack
 // bounds set up yet.
 //
@@ -1243,7 +1268,7 @@ func mStackIsSystemAllocated() bool {
 //
 //go:nosplit
 //go:nowritebarrierrec
-func mstart() {
+func mstart0() {
 	_g_ := getg()
 
 	osStack := _g_.stack.lo == 0
@@ -1281,6 +1306,9 @@ func mstart() {
 	mexit(osStack)
 }
 
+// The go:noinline is to guarantee the getcallerpc/getcallersp below are safe,
+// so that we can set up g0.sched to return to the call of mstart1 above.
+//go:noinline
 func mstart1() {
 	_g_ := getg()
 
@@ -1288,11 +1316,16 @@ func mstart1() {
 		throw("bad runtime·mstart")
 	}
 
-	// Record the caller for use as the top of stack in mcall and
-	// for terminating the thread.
+	// Set up m.g0.sched as a label returning to just
+	// after the mstart1 call in mstart0 above, for use by goexit0 and mcall.
 	// We're never coming back to mstart1 after we call schedule,
 	// so other calls can reuse the current frame.
-	save(getcallerpc(), getcallersp())
+	// And goexit0 does a gogo that needs to return from mstart1
+	// and let mstart0 exit the thread.
+	_g_.sched.g = guintptr(unsafe.Pointer(_g_))
+	_g_.sched.pc = getcallerpc()
+	_g_.sched.sp = getcallersp()
+
 	asminit()
 	minit()
 
@@ -1848,6 +1881,10 @@ func needm() {
 	// Store the original signal mask for use by minit.
 	mp.sigmask = sigmask
 
+	// Install TLS on some platforms (previously setg
+	// would do this if necessary).
+	osSetupTLS(mp)
+
 	// Install g (= m->g0) and set the stack bounds
 	// to match the current stack. We don't actually know
 	// how big the stack is, like we don't know how big any
@@ -1900,7 +1937,7 @@ func oneNewExtraM() {
 	gp := malg(4096)
 	gp.sched.pc = funcPC(goexit) + sys.PCQuantum
 	gp.sched.sp = gp.stack.hi
-	gp.sched.sp -= 4 * sys.RegSize // extra space in case of reads slightly beyond frame
+	gp.sched.sp -= 4 * sys.PtrSize // extra space in case of reads slightly beyond frame
 	gp.sched.lr = 0
 	gp.sched.g = guintptr(unsafe.Pointer(gp))
 	gp.syscallpc = gp.sched.pc
@@ -2012,7 +2049,7 @@ func lockextra(nilokay bool) *m {
 	for {
 		old := atomic.Loaduintptr(&extram)
 		if old == locked {
-			osyield()
+			osyield_no_g()
 			continue
 		}
 		if old == 0 && !nilokay {
@@ -2023,13 +2060,13 @@ func lockextra(nilokay bool) *m {
 				atomic.Xadd(&extraMWaiters, 1)
 				incr = true
 			}
-			usleep(1)
+			usleep_no_g(1)
 			continue
 		}
 		if atomic.Casuintptr(&extram, old, locked) {
 			return (*m)(unsafe.Pointer(old))
 		}
-		osyield()
+		osyield_no_g()
 		continue
 	}
 }
@@ -3445,11 +3482,19 @@ func goexit0(gp *g) {
 func save(pc, sp uintptr) {
 	_g_ := getg()
 
+	if _g_ == _g_.m.g0 || _g_ == _g_.m.gsignal {
+		// m.g0.sched is special and must describe the context
+		// for exiting the thread. mstart1 writes to it directly.
+		// m.gsignal.sched should not be used at all.
+		// This check makes sure save calls do not accidentally
+		// run in contexts where they'd write to system g's.
+		throw("save on system g not allowed")
+	}
+
 	_g_.sched.pc = pc
 	_g_.sched.sp = sp
 	_g_.sched.lr = 0
 	_g_.sched.ret = 0
-	_g_.sched.g = guintptr(unsafe.Pointer(_g_))
 	// We need to ensure ctxt is zero, but can't have a write
 	// barrier here. However, it should always already be zero.
 	// Assert that.
@@ -3463,7 +3508,7 @@ func save(pc, sp uintptr) {
 // This is called only from the go syscall library and cgocall,
 // not from the low-level system calls used by the runtime.
 //
-// Entersyscall cannot split the stack: the gosave must
+// Entersyscall cannot split the stack: the save must
 // make g->sched refer to the caller's stack segment, because
 // entersyscall is going to return immediately after.
 //
@@ -3809,15 +3854,15 @@ func exitsyscallfast_pidle() bool {
 // exitsyscall slow path on g0.
 // Failed to acquire P, enqueue gp as runnable.
 //
+// Called via mcall, so gp is the calling g from this M.
+//
 //go:nowritebarrierrec
 func exitsyscall0(gp *g) {
-	_g_ := getg()
-
 	casgstatus(gp, _Gsyscall, _Grunnable)
 	dropg()
 	lock(&sched.lock)
 	var _p_ *p
-	if schedEnabled(_g_) {
+	if schedEnabled(gp) {
 		_p_ = pidleget()
 	}
 	if _p_ == nil {
@@ -3831,8 +3876,11 @@ func exitsyscall0(gp *g) {
 		acquirep(_p_)
 		execute(gp, false) // Never returns.
 	}
-	if _g_.m.lockedg != 0 {
+	if gp.lockedm != 0 {
 		// Wait until another thread schedules gp and so m again.
+		//
+		// N.B. lockedm must be this M, as this g was running on this M
+		// before entersyscall.
 		stoplockedm()
 		execute(gp, false) // Never returns.
 	}
@@ -3997,6 +4045,14 @@ func newproc(siz int32, fn *funcval) {
 //
 //go:systemstack
 func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) *g {
+	if goexperiment.RegabiDefer && narg != 0 {
+		// TODO: When we commit to GOEXPERIMENT=regabidefer,
+		// rewrite the comments for newproc and newproc1.
+		// newproc will no longer have a funny stack layout or
+		// need to be nosplit.
+		throw("go with non-empty frame")
+	}
+
 	_g_ := getg()
 
 	if fn == nil {
@@ -4009,9 +4065,9 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 
 	// We could allocate a larger initial stack if necessary.
 	// Not worth it: this is almost always an error.
-	// 4*sizeof(uintreg): extra space added below
-	// sizeof(uintreg): caller's LR (arm) or return address (x86, in gostartcall).
-	if siz >= _StackMin-4*sys.RegSize-sys.RegSize {
+	// 4*PtrSize: extra space added below
+	// PtrSize: caller's LR (arm) or return address (x86, in gostartcall).
+	if siz >= _StackMin-4*sys.PtrSize-sys.PtrSize {
 		throw("newproc: function arguments too large for new goroutine")
 	}
 
@@ -4030,8 +4086,8 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 		throw("newproc1: new g is not Gdead")
 	}
 
-	totalSize := 4*sys.RegSize + uintptr(siz) + sys.MinFrameSize // extra space in case of reads slightly beyond frame
-	totalSize += -totalSize & (sys.SpAlign - 1)                  // align to spAlign
+	totalSize := 4*sys.PtrSize + uintptr(siz) + sys.MinFrameSize // extra space in case of reads slightly beyond frame
+	totalSize += -totalSize & (sys.StackAlign - 1)               // align to StackAlign
 	sp := newg.stack.hi - totalSize
 	spArg := sp
 	if usesLR {
@@ -4151,17 +4207,25 @@ func gfput(_p_ *p, gp *g) {
 	_p_.gFree.push(gp)
 	_p_.gFree.n++
 	if _p_.gFree.n >= 64 {
-		lock(&sched.gFree.lock)
+		var (
+			inc      int32
+			stackQ   gQueue
+			noStackQ gQueue
+		)
 		for _p_.gFree.n >= 32 {
-			_p_.gFree.n--
 			gp = _p_.gFree.pop()
+			_p_.gFree.n--
 			if gp.stack.lo == 0 {
-				sched.gFree.noStack.push(gp)
+				noStackQ.push(gp)
 			} else {
-				sched.gFree.stack.push(gp)
+				stackQ.push(gp)
 			}
-			sched.gFree.n++
+			inc++
 		}
+		lock(&sched.gFree.lock)
+		sched.gFree.noStack.pushAll(noStackQ)
+		sched.gFree.stack.pushAll(stackQ)
+		sched.gFree.n += inc
 		unlock(&sched.gFree.lock)
 	}
 }
@@ -4213,17 +4277,25 @@ retry:
 
 // Purge all cached G's from gfree list to the global list.
 func gfpurge(_p_ *p) {
-	lock(&sched.gFree.lock)
+	var (
+		inc      int32
+		stackQ   gQueue
+		noStackQ gQueue
+	)
 	for !_p_.gFree.empty() {
 		gp := _p_.gFree.pop()
 		_p_.gFree.n--
 		if gp.stack.lo == 0 {
-			sched.gFree.noStack.push(gp)
+			noStackQ.push(gp)
 		} else {
-			sched.gFree.stack.push(gp)
+			stackQ.push(gp)
 		}
-		sched.gFree.n++
+		inc++
 	}
+	lock(&sched.gFree.lock)
+	sched.gFree.noStack.pushAll(noStackQ)
+	sched.gFree.stack.pushAll(stackQ)
+	sched.gFree.n += inc
 	unlock(&sched.gFree.lock)
 }
 
@@ -4404,75 +4476,6 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	// See golang.org/issue/17165.
 	getg().m.mallocing++
 
-	// Define that a "user g" is a user-created goroutine, and a "system g"
-	// is one that is m->g0 or m->gsignal.
-	//
-	// We might be interrupted for profiling halfway through a
-	// goroutine switch. The switch involves updating three (or four) values:
-	// g, PC, SP, and (on arm) LR. The PC must be the last to be updated,
-	// because once it gets updated the new g is running.
-	//
-	// When switching from a user g to a system g, LR is not considered live,
-	// so the update only affects g, SP, and PC. Since PC must be last, there
-	// the possible partial transitions in ordinary execution are (1) g alone is updated,
-	// (2) both g and SP are updated, and (3) SP alone is updated.
-	// If SP or g alone is updated, we can detect the partial transition by checking
-	// whether the SP is within g's stack bounds. (We could also require that SP
-	// be changed only after g, but the stack bounds check is needed by other
-	// cases, so there is no need to impose an additional requirement.)
-	//
-	// There is one exceptional transition to a system g, not in ordinary execution.
-	// When a signal arrives, the operating system starts the signal handler running
-	// with an updated PC and SP. The g is updated last, at the beginning of the
-	// handler. There are two reasons this is okay. First, until g is updated the
-	// g and SP do not match, so the stack bounds check detects the partial transition.
-	// Second, signal handlers currently run with signals disabled, so a profiling
-	// signal cannot arrive during the handler.
-	//
-	// When switching from a system g to a user g, there are three possibilities.
-	//
-	// First, it may be that the g switch has no PC update, because the SP
-	// either corresponds to a user g throughout (as in asmcgocall)
-	// or because it has been arranged to look like a user g frame
-	// (as in cgocallback). In this case, since the entire
-	// transition is a g+SP update, a partial transition updating just one of
-	// those will be detected by the stack bounds check.
-	//
-	// Second, when returning from a signal handler, the PC and SP updates
-	// are performed by the operating system in an atomic update, so the g
-	// update must be done before them. The stack bounds check detects
-	// the partial transition here, and (again) signal handlers run with signals
-	// disabled, so a profiling signal cannot arrive then anyway.
-	//
-	// Third, the common case: it may be that the switch updates g, SP, and PC
-	// separately. If the PC is within any of the functions that does this,
-	// we don't ask for a traceback. C.F. the function setsSP for more about this.
-	//
-	// There is another apparently viable approach, recorded here in case
-	// the "PC within setsSP function" check turns out not to be usable.
-	// It would be possible to delay the update of either g or SP until immediately
-	// before the PC update instruction. Then, because of the stack bounds check,
-	// the only problematic interrupt point is just before that PC update instruction,
-	// and the sigprof handler can detect that instruction and simulate stepping past
-	// it in order to reach a consistent state. On ARM, the update of g must be made
-	// in two places (in R10 and also in a TLS slot), so the delayed update would
-	// need to be the SP update. The sigprof handler must read the instruction at
-	// the current PC and if it was the known instruction (for example, JMP BX or
-	// MOV R2, PC), use that other register in place of the PC value.
-	// The biggest drawback to this solution is that it requires that we can tell
-	// whether it's safe to read from the memory pointed at by PC.
-	// In a correct program, we can test PC == nil and otherwise read,
-	// but if a profiling signal happens at the instant that a program executes
-	// a bad jump (before the program manages to handle the resulting fault)
-	// the profiling handler could fault trying to read nonexistent memory.
-	//
-	// To recap, there are no constraints on the assembly being used for the
-	// transition. We simply require that g and SP match and that the PC is not
-	// in gogo.
-	traceback := true
-	if gp == nil || sp < gp.stack.lo || gp.stack.hi < sp || setsSP(pc) || (mp != nil && mp.vdsoSP != 0) {
-		traceback = false
-	}
 	var stk [maxCPUProfStack]uintptr
 	n := 0
 	if mp.ncgo > 0 && mp.curg != nil && mp.curg.syscallpc != 0 && mp.curg.syscallsp != 0 {
@@ -4495,7 +4498,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		if n > 0 {
 			n += cgoOff
 		}
-	} else if traceback {
+	} else {
 		n = gentraceback(pc, sp, lr, gp, 0, &stk[0], len(stk), nil, nil, _TraceTrap|_TraceJumpStack)
 	}
 
@@ -4572,30 +4575,6 @@ func sigprofNonGoPC(pc uintptr) {
 		}
 		cpuprof.addNonGo(stk)
 	}
-}
-
-// Reports whether a function will set the SP
-// to an absolute value. Important that
-// we don't traceback when these are at the bottom
-// of the stack since we can't be sure that we will
-// find the caller.
-//
-// If the function is not on the bottom of the stack
-// we assume that it will have set it up so that traceback will be consistent,
-// either by being a traceback terminating function
-// or putting one on the stack at the right offset.
-func setsSP(pc uintptr) bool {
-	f := findfunc(pc)
-	if !f.valid() {
-		// couldn't find the function for this PC,
-		// so assume the worst and stop traceback
-		return true
-	}
-	switch f.funcID {
-	case funcID_gogo, funcID_systemstack, funcID_mcall, funcID_morestack:
-		return true
-	}
-	return false
 }
 
 // setcpuprofilerate sets the CPU profiling rate to hz times per second.
@@ -5027,11 +5006,9 @@ func checkdead() {
 	}
 
 	grunning := 0
-	lock(&allglock)
-	for i := 0; i < len(allgs); i++ {
-		gp := allgs[i]
+	forEachG(func(gp *g) {
 		if isSystemGoroutine(gp, false) {
-			continue
+			return
 		}
 		s := readgstatus(gp)
 		switch s &^ _Gscan {
@@ -5044,8 +5021,7 @@ func checkdead() {
 			print("runtime: checkdead: find g ", gp.goid, " in status ", s, "\n")
 			throw("checkdead: runnable g")
 		}
-	}
-	unlock(&allglock)
+	})
 	if grunning == 0 { // possible if main goroutine calls runtime·Goexit()
 		unlock(&sched.lock) // unlock so that GODEBUG=scheddetail=1 doesn't hang
 		throw("no goroutines (main called runtime.Goexit) - deadlock!")
@@ -5349,7 +5325,7 @@ func preemptall() bool {
 
 // Tell the goroutine running on processor P to stop.
 // This function is purely best-effort. It can incorrectly fail to inform the
-// goroutine. It can send inform the wrong goroutine. Even if it informs the
+// goroutine. It can inform the wrong goroutine. Even if it informs the
 // correct goroutine, that goroutine might ignore the request if it is
 // simultaneously executing newstack.
 // No lock needs to be held.
@@ -5369,7 +5345,7 @@ func preemptone(_p_ *p) bool {
 
 	gp.preempt = true
 
-	// Every call in a go routine checks for stack overflow by
+	// Every call in a goroutine checks for stack overflow by
 	// comparing the current stack pointer to gp->stackguard0.
 	// Setting gp->stackguard0 to StackPreempt folds
 	// preemption into the normal stack overflow check.
@@ -5448,9 +5424,7 @@ func schedtrace(detailed bool) {
 		print("  M", mp.id, ": p=", id1, " curg=", id2, " mallocing=", mp.mallocing, " throwing=", mp.throwing, " preemptoff=", mp.preemptoff, ""+" locks=", mp.locks, " dying=", mp.dying, " spinning=", mp.spinning, " blocked=", mp.blocked, " lockedg=", id3, "\n")
 	}
 
-	lock(&allglock)
-	for gi := 0; gi < len(allgs); gi++ {
-		gp := allgs[gi]
+	forEachG(func(gp *g) {
 		mp := gp.m
 		lockedm := gp.lockedm.ptr()
 		id1 := int64(-1)
@@ -5462,8 +5436,7 @@ func schedtrace(detailed bool) {
 			id2 = lockedm.id
 		}
 		print("  G", gp.goid, ": status=", readgstatus(gp), "(", gp.waitreason.String(), ") m=", id1, " lockedm=", id2, "\n")
-	}
-	unlock(&allglock)
+	})
 	unlock(&sched.lock)
 }
 
@@ -6066,26 +6039,6 @@ func setMaxThreads(in int) (out int) {
 	return
 }
 
-func haveexperiment(name string) bool {
-	x := sys.Goexperiment
-	for x != "" {
-		xname := ""
-		i := bytealg.IndexByteString(x, ',')
-		if i < 0 {
-			xname, x = x, ""
-		} else {
-			xname, x = x[:i], x[i+1:]
-		}
-		if xname == name {
-			return true
-		}
-		if len(xname) > 2 && xname[:2] == "no" && xname[2:] == name {
-			return false
-		}
-	}
-	return false
-}
-
 //go:nosplit
 func procPin() int {
 	_g_ := getg()
@@ -6222,7 +6175,7 @@ var inittrace tracestat
 
 type tracestat struct {
 	active bool   // init tracing activation status
-	id     int64  // init go routine id
+	id     int64  // init goroutine id
 	allocs uint64 // heap allocations
 	bytes  uint64 // heap allocated bytes
 }
@@ -6254,7 +6207,7 @@ func doInit(t *initTask) {
 
 		if inittrace.active {
 			start = nanotime()
-			// Load stats non-atomically since tracinit is updated only by this init go routine.
+			// Load stats non-atomically since tracinit is updated only by this init goroutine.
 			before = inittrace
 		}
 
@@ -6267,7 +6220,7 @@ func doInit(t *initTask) {
 
 		if inittrace.active {
 			end := nanotime()
-			// Load stats non-atomically since tracinit is updated only by this init go routine.
+			// Load stats non-atomically since tracinit is updated only by this init goroutine.
 			after := inittrace
 
 			pkg := funcpkgpath(findfunc(funcPC(firstFunc)))

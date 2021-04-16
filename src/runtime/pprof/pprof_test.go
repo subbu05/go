@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !js
 // +build !js
 
 package pprof
@@ -261,33 +262,25 @@ func parseProfile(t *testing.T, valBytes []byte, f func(uintptr, []*profile.Loca
 // as interpreted by matches, and returns the parsed profile.
 func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []string, f func(dur time.Duration)) *profile.Profile {
 	switch runtime.GOOS {
-	case "darwin", "ios":
-		switch runtime.GOARCH {
-		case "arm64":
-			// nothing
-		default:
-			out, err := exec.Command("uname", "-a").CombinedOutput()
-			if err != nil {
-				t.Fatal(err)
-			}
-			vers := string(out)
-			t.Logf("uname -a: %v", vers)
+	case "darwin":
+		out, err := exec.Command("uname", "-a").CombinedOutput()
+		if err != nil {
+			t.Fatal(err)
 		}
+		vers := string(out)
+		t.Logf("uname -a: %v", vers)
 	case "plan9":
 		t.Skip("skipping on plan9")
 	}
 
 	broken := false
 	switch runtime.GOOS {
-	case "darwin", "ios", "dragonfly", "netbsd", "illumos", "solaris":
+	// See https://golang.org/issue/45170 for AIX.
+	case "ios", "dragonfly", "netbsd", "illumos", "solaris", "aix":
 		broken = true
 	case "openbsd":
 		if runtime.GOARCH == "arm" || runtime.GOARCH == "arm64" {
 			broken = true
-		}
-	case "windows":
-		if runtime.GOARCH == "arm" {
-			broken = true // See https://golang.org/issues/42862
 		}
 	}
 
@@ -514,8 +507,10 @@ func TestGoroutineSwitch(t *testing.T) {
 		}
 		StopCPUProfile()
 
-		// Read profile to look for entries for runtime.gogo with an attempt at a traceback.
-		// The special entry
+		// Read profile to look for entries for gogo with an attempt at a traceback.
+		// "runtime.gogo" is OK, because that's the part of the context switch
+		// before the actual switch begins. But we should not see "gogo",
+		// aka "gogo<>(SB)", which does the actual switch and is marked SPWRITE.
 		parseProfile(t, prof.Bytes(), func(count uintptr, stk []*profile.Location, _ map[string][]string) {
 			// An entry with two frames with 'System' in its top frame
 			// exists to record a PC without a traceback. Those are okay.
@@ -526,13 +521,19 @@ func TestGoroutineSwitch(t *testing.T) {
 				}
 			}
 
-			// Otherwise, should not see runtime.gogo.
+			// An entry with just one frame is OK too:
+			// it knew to stop at gogo.
+			if len(stk) == 1 {
+				return
+			}
+
+			// Otherwise, should not see gogo.
 			// The place we'd see it would be the inner most frame.
 			name := stk[0].Line[0].Function.Name
-			if name == "runtime.gogo" {
+			if name == "gogo" {
 				var buf bytes.Buffer
 				fprintStack(&buf, stk)
-				t.Fatalf("found profile entry for runtime.gogo:\n%s", buf.String())
+				t.Fatalf("found profile entry for gogo:\n%s", buf.String())
 			}
 		})
 	}
@@ -603,17 +604,20 @@ func TestMorestack(t *testing.T) {
 
 //go:noinline
 func growstack1() {
-	growstack()
+	growstack(10)
 }
 
 //go:noinline
-func growstack() {
-	var buf [8 << 10]byte
+func growstack(n int) {
+	var buf [8 << 16]byte
 	use(buf)
+	if n > 0 {
+		growstack(n - 1)
+	}
 }
 
 //go:noinline
-func use(x [8 << 10]byte) {}
+func use(x [8 << 16]byte) {}
 
 func TestBlockProfile(t *testing.T) {
 	type TestCase struct {

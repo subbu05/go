@@ -587,7 +587,7 @@ func (e *escape) exprSkipInit(k hole, n ir.Node) {
 
 	switch n.Op() {
 	default:
-		base.Fatalf("unexpected expr: %v", n)
+		base.Fatalf("unexpected expr: %s %v", n.Op().String(), n)
 
 	case ir.OLITERAL, ir.ONIL, ir.OGETG, ir.OTYPE, ir.OMETHEXPR, ir.OLINKSYMOFFSET:
 		// nop
@@ -1625,9 +1625,10 @@ func containsClosure(f, c *ir.Func) bool {
 
 // leak records that parameter l leaks to sink.
 func (l *location) leakTo(sink *location, derefs int) {
-	// If sink is a result parameter and we can fit return bits
-	// into the escape analysis tag, then record a return leak.
-	if sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
+	// If sink is a result parameter that doesn't escape (#44614)
+	// and we can fit return bits into the escape analysis tag,
+	// then record as a result leak.
+	if !sink.escapes && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
 		ri := sink.resultIndex - 1
 		if ri < numEscResults {
 			// Leak to result parameter.

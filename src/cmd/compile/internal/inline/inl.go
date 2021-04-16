@@ -354,8 +354,13 @@ func (v *hairyVisitor) doNode(n ir.Node) bool {
 		return true
 
 	case ir.OCLOSURE:
-		// TODO(danscales) - fix some bugs when budget is lowered below 15
-		// Maybe make budget proportional to number of closure variables, e.g.:
+		if base.Debug.InlFuncsWithClosures == 0 {
+			v.reason = "not inlining functions with closures"
+			return true
+		}
+
+		// TODO(danscales): Maybe make budget proportional to number of closure
+		// variables, e.g.:
 		//v.budget -= int32(len(n.(*ir.ClosureExpr).Func.ClosureVars) * 3)
 		v.budget -= 15
 		// Scan body of closure (which DoChildren doesn't automatically
@@ -376,6 +381,22 @@ func (v *hairyVisitor) doNode(n ir.Node) bool {
 
 	case ir.OAPPEND:
 		v.budget -= inlineExtraAppendCost
+
+	case ir.ODEREF:
+		// *(*X)(unsafe.Pointer(&x)) is low-cost
+		n := n.(*ir.StarExpr)
+
+		ptr := n.X
+		for ptr.Op() == ir.OCONVNOP {
+			ptr = ptr.(*ir.ConvExpr).X
+		}
+		if ptr.Op() == ir.OADDR {
+			v.budget += 1 // undo half of default cost of ir.ODEREF+ir.OADDR
+		}
+
+	case ir.OCONVNOP:
+		// This doesn't produce code, but the children might.
+		v.budget++ // undo default cost
 
 	case ir.ODCLCONST, ir.OFALL:
 		// These nodes don't produce code; omit from inlining budget.
@@ -485,7 +506,10 @@ func inlcopy(n ir.Node) ir.Node {
 			newfn.Nname = ir.NewNameAt(oldfn.Nname.Pos(), oldfn.Nname.Sym())
 			// XXX OK to share fn.Type() ??
 			newfn.Nname.SetType(oldfn.Nname.Type())
-			newfn.Nname.Ntype = inlcopy(oldfn.Nname.Ntype).(ir.Ntype)
+			// Ntype can be nil for -G=3 mode.
+			if oldfn.Nname.Ntype != nil {
+				newfn.Nname.Ntype = inlcopy(oldfn.Nname.Ntype).(ir.Ntype)
+			}
 			newfn.Body = inlcopylist(oldfn.Body)
 			// Make shallow copy of the Dcl and ClosureVar slices
 			newfn.Dcl = append([]*ir.Name(nil), oldfn.Dcl...)
@@ -829,17 +853,25 @@ func mkinlcall(n *ir.CallExpr, fn *ir.Func, maxCost int32, inlMap map[*ir.Func]b
 		}
 	}
 
+	// We can delay declaring+initializing result parameters if:
+	// (1) there's exactly one "return" statement in the inlined function;
+	// (2) it's not an empty return statement (#44355); and
+	// (3) the result parameters aren't named.
+	delayretvars := true
+
 	nreturns := 0
 	ir.VisitList(ir.Nodes(fn.Inl.Body), func(n ir.Node) {
-		if n != nil && n.Op() == ir.ORETURN {
+		if n, ok := n.(*ir.ReturnStmt); ok {
 			nreturns++
+			if len(n.Results) == 0 {
+				delayretvars = false // empty return statement (case 2)
+			}
 		}
 	})
 
-	// We can delay declaring+initializing result parameters if:
-	// (1) there's only one "return" statement in the inlined
-	// function, and (2) the result parameters aren't named.
-	delayretvars := nreturns == 1
+	if nreturns != 1 {
+		delayretvars = false // not exactly one return statement (case 1)
+	}
 
 	// temporaries for return values.
 	var retvars []ir.Node
@@ -850,7 +882,7 @@ func mkinlcall(n *ir.CallExpr, fn *ir.Func, maxCost int32, inlMap map[*ir.Func]b
 			m = inlvar(n)
 			m = typecheck.Expr(m).(*ir.Name)
 			inlvars[n] = m
-			delayretvars = false // found a named result parameter
+			delayretvars = false // found a named result parameter (case 3)
 		} else {
 			// anonymous return values, synthesize names for use in assignment that replaces return
 			m = retvar(t, i)
@@ -981,7 +1013,9 @@ func mkinlcall(n *ir.CallExpr, fn *ir.Func, maxCost int32, inlMap map[*ir.Func]b
 	lab := ir.NewLabelStmt(base.Pos, retlabel)
 	body = append(body, lab)
 
-	typecheck.Stmts(body)
+	if !typecheck.Go117ExportTypes {
+		typecheck.Stmts(body)
+	}
 
 	if base.Flag.GenDwarfInl > 0 {
 		for _, v := range inlfvars {
@@ -1184,7 +1218,10 @@ func (subst *inlsubst) closure(n *ir.ClosureExpr) ir.Node {
 	newfn.SetIsHiddenClosure(true)
 	newfn.Nname = ir.NewNameAt(n.Pos(), ir.BlankNode.Sym())
 	newfn.Nname.Func = newfn
-	newfn.Nname.Ntype = subst.node(oldfn.Nname.Ntype).(ir.Ntype)
+	// Ntype can be nil for -G=3 mode.
+	if oldfn.Nname.Ntype != nil {
+		newfn.Nname.Ntype = subst.node(oldfn.Nname.Ntype).(ir.Ntype)
+	}
 	newfn.Nname.Defn = newfn
 
 	m.(*ir.ClosureExpr).Func = newfn
@@ -1221,7 +1258,7 @@ func (subst *inlsubst) closure(n *ir.ClosureExpr) ir.Node {
 		newrecv = newrecvs[0]
 	}
 	newt := types.NewSignature(oldt.Pkg(), newrecv,
-		subst.fields(oldt.Params()), subst.fields(oldt.Results()))
+		nil, subst.fields(oldt.Params()), subst.fields(oldt.Results()))
 
 	newfn.Nname.SetType(newt)
 	newfn.Body = subst.list(oldfn.Body)

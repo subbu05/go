@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package runtime_test
@@ -7,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"internal/testenv"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -28,11 +28,7 @@ func TestVectoredHandlerDontCrashOnLibrary(t *testing.T) {
 	testenv.MustHaveExecPath(t, "gcc")
 	testprog.Lock()
 	defer testprog.Unlock()
-	dir, err := os.MkdirTemp("", "go-build")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// build go dll
 	dll := filepath.Join(dir, "testwinlib.dll")
@@ -156,11 +152,7 @@ func TestLibraryCtrlHandler(t *testing.T) {
 	testenv.MustHaveExecPath(t, "gcc")
 	testprog.Lock()
 	defer testprog.Unlock()
-	dir, err := os.MkdirTemp("", "go-build")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// build go dll
 	dll := filepath.Join(dir, "dummy.dll")

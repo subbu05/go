@@ -157,8 +157,7 @@ func walkExpr1(n ir.Node, init *ir.Nodes) ir.Node {
 		return mkcall("gopanic", nil, init, n.X)
 
 	case ir.ORECOVER:
-		n := n.(*ir.CallExpr)
-		return mkcall("gorecover", n.Type(), init, typecheck.NodAddr(ir.RegFP))
+		return walkRecover(n.(*ir.CallExpr), init)
 
 	case ir.OCFUNC:
 		return n
@@ -682,12 +681,16 @@ func walkIndexMap(n *ir.IndexExpr, init *ir.Nodes) ir.Node {
 	if n.Assigned {
 		// This m[k] expression is on the left-hand side of an assignment.
 		fast := mapfast(t)
-		if fast == mapslow {
+		switch fast {
+		case mapslow:
 			// standard version takes key by reference.
 			// order.expr made sure key is addressable.
 			key = typecheck.NodAddr(key)
+		case mapfast32ptr, mapfast64ptr:
+			// pointer version takes pointer key.
+			key = ir.NewConvExpr(n.Pos(), ir.OCONVNOP, types.Types[types.TUNSAFEPTR], key)
 		}
-		call = mkcall1(mapfn(mapassign[fast], t), nil, init, reflectdata.TypePtr(t), map_, key)
+		call = mkcall1(mapfn(mapassign[fast], t, false), nil, init, reflectdata.TypePtr(t), map_, key)
 	} else {
 		// m[k] is not the target of an assignment.
 		fast := mapfast(t)
@@ -698,10 +701,10 @@ func walkIndexMap(n *ir.IndexExpr, init *ir.Nodes) ir.Node {
 		}
 
 		if w := t.Elem().Width; w <= zeroValSize {
-			call = mkcall1(mapfn(mapaccess1[fast], t), types.NewPtr(t.Elem()), init, reflectdata.TypePtr(t), map_, key)
+			call = mkcall1(mapfn(mapaccess1[fast], t, false), types.NewPtr(t.Elem()), init, reflectdata.TypePtr(t), map_, key)
 		} else {
 			z := reflectdata.ZeroAddr(w)
-			call = mkcall1(mapfn("mapaccess1_fat", t), types.NewPtr(t.Elem()), init, reflectdata.TypePtr(t), map_, key, z)
+			call = mkcall1(mapfn("mapaccess1_fat", t, true), types.NewPtr(t.Elem()), init, reflectdata.TypePtr(t), map_, key, z)
 		}
 	}
 	call.SetType(types.NewPtr(t.Elem()))
@@ -924,7 +927,7 @@ func usemethod(n *ir.CallExpr) {
 }
 
 func usefield(n *ir.SelectorExpr) {
-	if objabi.Fieldtrack_enabled == 0 {
+	if !objabi.Experiment.FieldTrack {
 		return
 	}
 

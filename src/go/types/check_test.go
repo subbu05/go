@@ -30,11 +30,11 @@ import (
 	"fmt"
 	"go/ast"
 	"go/importer"
+	"go/internal/typeparams"
 	"go/parser"
 	"go/scanner"
 	"go/token"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -69,11 +69,11 @@ func splitError(err error) (pos, msg string) {
 	return
 }
 
-func parseFiles(t *testing.T, filenames []string, srcs [][]byte) ([]*ast.File, []error) {
+func parseFiles(t *testing.T, filenames []string, srcs [][]byte, mode parser.Mode) ([]*ast.File, []error) {
 	var files []*ast.File
 	var errlist []error
 	for i, filename := range filenames {
-		file, err := parser.ParseFile(fset, filename, srcs[i], parser.AllErrors)
+		file, err := parser.ParseFile(fset, filename, srcs[i], mode)
 		if file == nil {
 			t.Fatalf("%s: %s", filename, err)
 		}
@@ -208,8 +208,17 @@ func checkFiles(t *testing.T, goVersion string, filenames []string, srcs [][]byt
 		t.Fatal("no source files")
 	}
 
+	mode := parser.AllErrors
+	if strings.HasSuffix(filenames[0], ".go2") {
+		if !typeparams.Enabled {
+			t.Skip("type params are not enabled")
+		}
+	} else {
+		mode |= typeparams.DisallowParsing
+	}
+
 	// parse files and collect parser errors
-	files, errlist := parseFiles(t, filenames, srcs)
+	files, errlist := parseFiles(t, filenames, srcs, mode)
 
 	pkgName := "<no package>"
 	if len(files) > 0 {
@@ -305,6 +314,7 @@ func TestLongConstants(t *testing.T) {
 }
 
 func TestTestdata(t *testing.T)  { DefPredeclaredTestFuncs(); testDir(t, "testdata") }
+func TestExamples(t *testing.T)  { testDir(t, "examples") }
 func TestFixedbugs(t *testing.T) { testDir(t, "fixedbugs") }
 
 func testDir(t *testing.T, dir string) {
@@ -322,7 +332,7 @@ func testDir(t *testing.T, dir string) {
 		// if fi is a directory, its files make up a single package
 		var filenames []string
 		if fi.IsDir() {
-			fis, err := ioutil.ReadDir(path)
+			fis, err := os.ReadDir(path)
 			if err != nil {
 				t.Error(err)
 				continue
