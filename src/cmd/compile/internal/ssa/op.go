@@ -16,7 +16,7 @@ import (
 // An Op encodes the specific operation that a Value performs.
 // Opcodes' semantics can be modified by the type and aux fields of the Value.
 // For instance, OpAdd can be 32 or 64 bit, signed or unsigned, float or complex, depending on Value.Type.
-// Semantics of each op are described in the opcode files in gen/*Ops.go.
+// Semantics of each op are described in the opcode files in _gen/*Ops.go.
 // There is one file for generic (architecture-independent) ops and one file
 // for each architecture.
 type Op int32
@@ -34,6 +34,7 @@ type opInfo struct {
 	resultNotInArgs   bool      // outputs must not be allocated to the same registers as inputs
 	clobberFlags      bool      // this op clobbers flags register
 	call              bool      // is a function call
+	tailCall          bool      // is a tail call
 	nilCheck          bool      // this op is a nil check on arg0
 	faultOnNilArg0    bool      // this op will fault if arg0 is nil (and aux encodes a small offset)
 	faultOnNilArg1    bool      // this op will fault if arg1 is nil (and aux encodes a small offset)
@@ -100,6 +101,10 @@ type AuxNameOffset struct {
 func (a *AuxNameOffset) CanBeAnSSAAux() {}
 func (a *AuxNameOffset) String() string {
 	return fmt.Sprintf("%s+%d", a.Name.Sym().Name, a.Offset)
+}
+
+func (a *AuxNameOffset) FrameOffset() int64 {
+	return a.Name.FrameOffset() + a.Offset
 }
 
 type AuxCall struct {
@@ -254,13 +259,13 @@ func (a *AuxCall) TypeOfArg(which int64) *types.Type {
 
 // SizeOfResult returns the size of result which (indexed 0, 1, etc).
 func (a *AuxCall) SizeOfResult(which int64) int64 {
-	return a.TypeOfResult(which).Width
+	return a.TypeOfResult(which).Size()
 }
 
 // SizeOfArg returns the size of argument which (indexed 0, 1, etc).
 // If the call is to a method, the receiver is the first argument (i.e., index 0)
 func (a *AuxCall) SizeOfArg(which int64) int64 {
-	return a.TypeOfArg(which).Width
+	return a.TypeOfArg(which).Size()
 }
 
 // NResults returns the number of results
@@ -386,9 +391,9 @@ const (
 
 // A Sym represents a symbolic offset from a base register.
 // Currently a Sym can be one of 3 things:
-//  - a *gc.Node, for an offset from SP (the stack pointer)
-//  - a *obj.LSym, for an offset from SB (the global pointer)
-//  - nil, for no offset
+//   - a *gc.Node, for an offset from SP (the stack pointer)
+//   - a *obj.LSym, for an offset from SB (the global pointer)
+//   - nil, for no offset
 type Sym interface {
 	CanBeAnSSASym()
 	CanBeAnSSAAux()
@@ -469,16 +474,18 @@ const (
 	BoundsSlice3BU                      // ... with unsigned high
 	BoundsSlice3C                       // 3-arg slicing operation, 0 <= low <= high failed
 	BoundsSlice3CU                      // ... with unsigned low
+	BoundsConvert                       // conversion to array pointer failed
 	BoundsKindCount
 )
 
-// boundsAPI determines which register arguments a bounds check call should use. For an [a:b:c] slice, we do:
-//   CMPQ c, cap
-//   JA   fail1
-//   CMPQ b, c
-//   JA   fail2
-//   CMPQ a, b
-//   JA   fail3
+// boundsABI determines which register arguments a bounds check call should use. For an [a:b:c] slice, we do:
+//
+//	CMPQ c, cap
+//	JA   fail1
+//	CMPQ b, c
+//	JA   fail2
+//	CMPQ a, b
+//	JA   fail3
 //
 // fail1: CALL panicSlice3Acap (c, cap)
 // fail2: CALL panicSlice3B (b, c)
@@ -496,7 +503,8 @@ func boundsABI(b int64) int {
 	case BoundsSlice3Alen,
 		BoundsSlice3AlenU,
 		BoundsSlice3Acap,
-		BoundsSlice3AcapU:
+		BoundsSlice3AcapU,
+		BoundsConvert:
 		return 0
 	case BoundsSliceAlen,
 		BoundsSliceAlenU,

@@ -15,8 +15,6 @@
 package liveness
 
 import (
-	"crypto/md5"
-	"crypto/sha1"
 	"fmt"
 	"os"
 	"sort"
@@ -31,6 +29,7 @@ import (
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/typebits"
 	"cmd/compile/internal/types"
+	"cmd/internal/notsha256"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/src"
@@ -81,15 +80,6 @@ import (
 // the liveness analysis work on single-word values as well, although
 // there are complications around interface values, slices, and strings,
 // all of which cannot be treated as individual words.
-//
-// OpVarKill is the opposite of OpVarDef: it marks a value as no longer needed,
-// even if its address has been taken. That is, an OpVarKill annotation asserts
-// that its argument is certainly dead, for use when the liveness analysis
-// would not otherwise be able to deduce that fact.
-
-// TODO: get rid of OpVarKill here. It's useful for stack frame allocation
-// so the compiler can allocate two temps to the same location. Here it's now
-// useless, since the implementation of stack objects.
 
 // blockEffects summarizes the liveness effects on an SSA block.
 type blockEffects struct {
@@ -146,7 +136,8 @@ type liveness struct {
 	// a part of it is used, but we may not initialize all parts.
 	partLiveArgs map[*ir.Name]bool
 
-	doClobber bool // Whether to clobber dead stack slots in this function.
+	doClobber     bool // Whether to clobber dead stack slots in this function.
+	noClobberArgs bool // Do not clobber function arguments
 }
 
 // Map maps from *ssa.Value to LivenessIndex.
@@ -244,8 +235,10 @@ func (lv *liveness) initcache() {
 // liveness effects on a variable.
 //
 // The possible flags are:
+//
 //	uevar - used by the instruction
 //	varkill - killed by the instruction (set)
+//
 // A kill happens after the use (for an instruction that updates a value, for example).
 type liveEffect int
 
@@ -267,13 +260,13 @@ func (lv *liveness) valueEffects(v *ssa.Value) (int32, liveEffect) {
 	// OpVarFoo pseudo-ops. Ignore them to prevent "lost track of
 	// variable" ICEs (issue 19632).
 	switch v.Op {
-	case ssa.OpVarDef, ssa.OpVarKill, ssa.OpVarLive, ssa.OpKeepAlive:
+	case ssa.OpVarDef, ssa.OpVarLive, ssa.OpKeepAlive:
 		if !n.Used() {
 			return -1, 0
 		}
 	}
 
-	if n.Class == ir.PPARAM && !n.Addrtaken() && n.Type().Width > int64(types.PtrSize) {
+	if n.Class == ir.PPARAM && !n.Addrtaken() && n.Type().Size() > int64(types.PtrSize) {
 		// Only aggregate-typed arguments that are not address-taken can be
 		// partially live.
 		lv.partLiveArgs[n] = true
@@ -332,7 +325,7 @@ func affectedVar(v *ssa.Value) (*ir.Name, ssa.SymEffect) {
 
 	case ssa.OpVarLive:
 		return v.Aux.(*ir.Name), ssa.SymRead
-	case ssa.OpVarDef, ssa.OpVarKill:
+	case ssa.OpVarDef:
 		return v.Aux.(*ir.Name), ssa.SymWrite
 	case ssa.OpKeepAlive:
 		n, _ := ssa.AutoVar(v.Args[0])
@@ -432,7 +425,7 @@ func (lv *liveness) pointerMap(liveout bitvec.BitVec, vars []*ir.Name, args, loc
 				if node.FrameOffset() < 0 {
 					lv.f.Fatalf("Node %v has frameoffset %d\n", node.Sym().Name, node.FrameOffset())
 				}
-				typebits.Set(node.Type(), node.FrameOffset(), args)
+				typebits.SetNoCheck(node.Type(), node.FrameOffset(), args)
 				break
 			}
 			fallthrough // PPARAMOUT in registers acts memory-allocates like an AUTO
@@ -854,8 +847,9 @@ func (lv *liveness) epilogue() {
 	if lv.fn.OpenCodedDeferDisallowed() {
 		lv.livenessMap.DeferReturn = objw.LivenessDontCare
 	} else {
+		idx, _ := lv.stackMapSet.add(livedefer)
 		lv.livenessMap.DeferReturn = objw.LivenessIndex{
-			StackMapIndex: lv.stackMapSet.add(livedefer),
+			StackMapIndex: idx,
 			IsUnsafePoint: false,
 		}
 	}
@@ -902,7 +896,7 @@ func (lv *liveness) compact(b *ssa.Block) {
 		isUnsafePoint := lv.allUnsafe || v.Op != ssa.OpClobber && lv.unsafePoints.Get(int32(v.ID))
 		idx := objw.LivenessIndex{StackMapIndex: objw.StackMapDontCare, IsUnsafePoint: isUnsafePoint}
 		if hasStackMap {
-			idx.StackMapIndex = lv.stackMapSet.add(lv.livevars[pos])
+			idx.StackMapIndex, _ = lv.stackMapSet.add(lv.livevars[pos])
 			pos++
 		}
 		if hasStackMap || isUnsafePoint {
@@ -930,22 +924,33 @@ func (lv *liveness) enableClobber() {
 		// Otherwise, giant functions make this experiment generate too much code.
 		return
 	}
-	if lv.f.Name == "forkAndExecInChild" || lv.f.Name == "wbBufFlush" {
+	if lv.f.Name == "forkAndExecInChild" {
 		// forkAndExecInChild calls vfork on some platforms.
 		// The code we add here clobbers parts of the stack in the child.
 		// When the parent resumes, it is using the same stack frame. But the
 		// child has clobbered stack variables that the parent needs. Boom!
 		// In particular, the sys argument gets clobbered.
-		//
+		return
+	}
+	if lv.f.Name == "wbBufFlush" ||
+		((lv.f.Name == "callReflect" || lv.f.Name == "callMethod") && lv.fn.ABIWrapper()) {
 		// runtime.wbBufFlush must not modify its arguments. See the comments
 		// in runtime/mwbbuf.go:wbBufFlush.
-		return
+		//
+		// reflect.callReflect and reflect.callMethod are called from special
+		// functions makeFuncStub and methodValueCall. The runtime expects
+		// that it can find the first argument (ctxt) at 0(SP) in makeFuncStub
+		// and methodValueCall's frame (see runtime/traceback.go:getArgInfo).
+		// Normally callReflect and callMethod already do not modify the
+		// argument, and keep it alive. But the compiler-generated ABI wrappers
+		// don't do that. Special case the wrappers to not clobber its arguments.
+		lv.noClobberArgs = true
 	}
 	if h := os.Getenv("GOCLOBBERDEADHASH"); h != "" {
 		// Clobber only functions where the hash of the function name matches a pattern.
 		// Useful for binary searching for a miscompiled function.
 		hstr := ""
-		for _, b := range sha1.Sum([]byte(lv.f.Name)) {
+		for _, b := range notsha256.Sum256([]byte(lv.f.Name)) {
 			hstr += fmt.Sprintf("%08b", b)
 		}
 		if !strings.HasSuffix(hstr, h) {
@@ -995,9 +1000,14 @@ func (lv *liveness) clobber(b *ssa.Block) {
 // of b.Values.
 func clobber(lv *liveness, b *ssa.Block, live bitvec.BitVec) {
 	for i, n := range lv.vars {
-		if !live.Get(int32(i)) && !n.Addrtaken() {
+		if !live.Get(int32(i)) && !n.Addrtaken() && !n.OpenDeferSlot() && !n.IsOutputParamHeapAddr() {
 			// Don't clobber stack objects (address-taken). They are
 			// tracked dynamically.
+			// Also don't clobber slots that are live for defers (see
+			// the code setting livedefer in epilogue).
+			if lv.noClobberArgs && n.Class == ir.PPARAM {
+				continue
+			}
 			clobberVar(b, n)
 		}
 	}
@@ -1063,6 +1073,10 @@ func clobberPtr(b *ssa.Block, v *ir.Name, offset int64) {
 
 func (lv *liveness) showlive(v *ssa.Value, live bitvec.BitVec) {
 	if base.Flag.Live == 0 || ir.FuncName(lv.fn) == "init" || strings.HasPrefix(ir.FuncName(lv.fn), ".") {
+		return
+	}
+	if lv.fn.Wrapper() || lv.fn.Dupok() {
+		// Skip reporting liveness information for compiler-generated wrappers.
 		return
 	}
 	if !(v == nil || v.Op.IsCall()) {
@@ -1305,19 +1319,9 @@ func (lv *liveness) emit() (argsSym, liveSym *obj.LSym) {
 		loff = objw.BitVec(&liveSymTmp, loff, locals)
 	}
 
-	// Give these LSyms content-addressable names,
-	// so that they can be de-duplicated.
-	// This provides significant binary size savings.
-	//
 	// These symbols will be added to Ctxt.Data by addGCLocals
 	// after parallel compilation is done.
-	makeSym := func(tmpSym *obj.LSym) *obj.LSym {
-		return base.Ctxt.LookupInit(fmt.Sprintf("gclocals·%x", md5.Sum(tmpSym.P)), func(lsym *obj.LSym) {
-			lsym.P = tmpSym.P
-			lsym.Set(obj.AttrContentAddressable, true)
-		})
-	}
-	return makeSym(&argsSymTmp), makeSym(&liveSymTmp)
+	return base.Ctxt.GCLocalsSym(argsSymTmp.P), base.Ctxt.GCLocalsSym(liveSymTmp.P)
 }
 
 // Entry pointer for Compute analysis. Solves for the Compute of
@@ -1407,6 +1411,7 @@ func (lv *liveness) emitStackObjects() *obj.LSym {
 	// Populate the stack object data.
 	// Format must match runtime/stack.go:stackObjectRecord.
 	x := base.Ctxt.Lookup(lv.fn.LSym.Name + ".stkobj")
+	x.Set(obj.AttrContentAddressable, true)
 	lv.fn.LSym.Func().StackObjects = x
 	off := 0
 	off = objw.Uintptr(x, off, uint64(len(vars)))
@@ -1414,8 +1419,26 @@ func (lv *liveness) emitStackObjects() *obj.LSym {
 		// Note: arguments and return values have non-negative Xoffset,
 		// in which case the offset is relative to argp.
 		// Locals have a negative Xoffset, in which case the offset is relative to varp.
-		off = objw.Uintptr(x, off, uint64(v.FrameOffset()))
-		off = objw.SymPtr(x, off, reflectdata.TypeLinksym(v.Type()), 0)
+		// We already limit the frame size, so the offset and the object size
+		// should not be too big.
+		frameOffset := v.FrameOffset()
+		if frameOffset != int64(int32(frameOffset)) {
+			base.Fatalf("frame offset too big: %v %d", v, frameOffset)
+		}
+		off = objw.Uint32(x, off, uint32(frameOffset))
+
+		t := v.Type()
+		sz := t.Size()
+		if sz != int64(int32(sz)) {
+			base.Fatalf("stack object too big: %v of type %v, size %d", v, t, sz)
+		}
+		lsym, useGCProg, ptrdata := reflectdata.GCSym(t)
+		if useGCProg {
+			ptrdata = -ptrdata
+		}
+		off = objw.Uint32(x, off, uint32(sz))
+		off = objw.Uint32(x, off, uint32(ptrdata))
+		off = objw.SymPtrOff(x, off, lsym)
 	}
 
 	if base.Flag.Live != 0 {
@@ -1430,14 +1453,14 @@ func (lv *liveness) emitStackObjects() *obj.LSym {
 // isfat reports whether a variable of type t needs multiple assignments to initialize.
 // For example:
 //
-// 	type T struct { x, y int }
-// 	x := T{x: 0, y: 1}
+//	type T struct { x, y int }
+//	x := T{x: 0, y: 1}
 //
 // Then we need:
 //
-// 	var t T
-// 	t.x = 0
-// 	t.y = 1
+//	var t T
+//	t.x = 0
+//	t.y = 1
 //
 // to fully initialize t.
 func isfat(t *types.Type) bool {
@@ -1475,7 +1498,7 @@ func WriteFuncMap(fn *ir.Func, abiInfo *abi.ABIParamResultInfo) {
 	bv := bitvec.New(int32(nptr) * 2)
 
 	for _, p := range abiInfo.InParams() {
-		typebits.Set(p.Type, p.FrameOffset(abiInfo), bv)
+		typebits.SetNoCheck(p.Type, p.FrameOffset(abiInfo), bv)
 	}
 
 	nbitmap := 1
@@ -1490,7 +1513,7 @@ func WriteFuncMap(fn *ir.Func, abiInfo *abi.ABIParamResultInfo) {
 	if fn.Type().NumResults() > 0 {
 		for _, p := range abiInfo.OutParams() {
 			if len(p.Registers) == 0 {
-				typebits.Set(p.Type, p.FrameOffset(abiInfo), bv)
+				typebits.SetNoCheck(p.Type, p.FrameOffset(abiInfo), bv)
 			}
 		}
 		off = objw.BitVec(lsym, off, bv)

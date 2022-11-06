@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"internal/buildcfg"
 	"sort"
 
 	"cmd/compile/internal/base"
@@ -90,6 +91,11 @@ func Info(fnsym *obj.LSym, infosym *obj.LSym, curfn interface{}) ([]dwarf.Scope,
 				continue
 			}
 			apdecls = append(apdecls, n)
+			if n.Type().Kind() == types.TSSA {
+				// Can happen for TypeInt128 types. This only happens for
+				// spill locations, so not a huge deal.
+				continue
+			}
 			fnsym.Func().RecordAutoType(reflectdata.TypeLinksym(n.Type()))
 		}
 	}
@@ -101,7 +107,7 @@ func Info(fnsym *obj.LSym, infosym *obj.LSym, curfn interface{}) ([]dwarf.Scope,
 	// the function symbol to insure that the type included in DWARF
 	// processing during linking.
 	typesyms := []*obj.LSym{}
-	for t, _ := range fnsym.Func().Autot {
+	for t := range fnsym.Func().Autot {
 		typesyms = append(typesyms, t)
 	}
 	sort.Sort(obj.BySymName(typesyms))
@@ -137,15 +143,46 @@ func createDwarfVars(fnsym *obj.LSym, complexOK bool, fn *ir.Func, apDecls []*ir
 	var vars []*dwarf.Var
 	var decls []*ir.Name
 	var selected ir.NameSet
+
 	if base.Ctxt.Flag_locationlists && base.Ctxt.Flag_optimize && fn.DebugInfo != nil && complexOK {
 		decls, vars, selected = createComplexVars(fnsym, fn)
+	} else if fn.ABI == obj.ABIInternal && base.Flag.N != 0 && complexOK {
+		decls, vars, selected = createABIVars(fnsym, fn, apDecls)
 	} else {
 		decls, vars, selected = createSimpleVars(fnsym, apDecls)
+	}
+	if fn.DebugInfo != nil {
+		// Recover zero sized variables eliminated by the stackframe pass
+		for _, n := range fn.DebugInfo.(*ssa.FuncDebug).OptDcl {
+			if n.Class != ir.PAUTO {
+				continue
+			}
+			types.CalcSize(n.Type())
+			if n.Type().Size() == 0 {
+				decls = append(decls, n)
+				vars = append(vars, createSimpleVar(fnsym, n))
+				vars[len(vars)-1].StackOffset = 0
+				fnsym.Func().RecordAutoType(reflectdata.TypeLinksym(n.Type()))
+			}
+		}
 	}
 
 	dcl := apDecls
 	if fnsym.WasInlined() {
 		dcl = preInliningDcls(fnsym)
+	} else {
+		// The backend's stackframe pass prunes away entries from the
+		// fn's Dcl list, including PARAMOUT nodes that correspond to
+		// output params passed in registers. Add back in these
+		// entries here so that we can process them properly during
+		// DWARF-gen. See issue 48573 for more details.
+		debugInfo := fn.DebugInfo.(*ssa.FuncDebug)
+		for _, n := range debugInfo.RegOutputParams {
+			if n.Class != ir.PPARAMOUT || !n.IsOutputParamInRegisters() {
+				panic("invalid ir.Name on debugInfo.RegOutputParams list")
+			}
+			dcl = append(dcl, n)
+		}
 	}
 
 	// If optimization is enabled, the list above will typically be
@@ -210,15 +247,71 @@ func createDwarfVars(fnsym *obj.LSym, complexOK bool, fn *ir.Func, apDecls []*ir
 			Type:          base.Ctxt.Lookup(typename),
 			DeclFile:      declpos.RelFilename(),
 			DeclLine:      declpos.RelLine(),
-			DeclCol:       declpos.Col(),
+			DeclCol:       declpos.RelCol(),
 			InlIndex:      int32(inlIndex),
 			ChildIndex:    -1,
+			DictIndex:     n.DictIndex,
 		})
 		// Record go type of to insure that it gets emitted by the linker.
 		fnsym.Func().RecordAutoType(reflectdata.TypeLinksym(n.Type()))
 	}
 
+	// Sort decls and vars.
+	sortDeclsAndVars(fn, decls, vars)
+
 	return decls, vars
+}
+
+// sortDeclsAndVars sorts the decl and dwarf var lists according to
+// parameter declaration order, so as to insure that when a subprogram
+// DIE is emitted, its parameter children appear in declaration order.
+// Prior to the advent of the register ABI, sorting by frame offset
+// would achieve this; with the register we now need to go back to the
+// original function signature.
+func sortDeclsAndVars(fn *ir.Func, decls []*ir.Name, vars []*dwarf.Var) {
+	paramOrder := make(map[*ir.Name]int)
+	idx := 1
+	for _, selfn := range types.RecvsParamsResults {
+		fsl := selfn(fn.Type()).FieldSlice()
+		for _, f := range fsl {
+			if n, ok := f.Nname.(*ir.Name); ok {
+				paramOrder[n] = idx
+				idx++
+			}
+		}
+	}
+	sort.Stable(varsAndDecls{decls, vars, paramOrder})
+}
+
+type varsAndDecls struct {
+	decls      []*ir.Name
+	vars       []*dwarf.Var
+	paramOrder map[*ir.Name]int
+}
+
+func (v varsAndDecls) Len() int {
+	return len(v.decls)
+}
+
+func (v varsAndDecls) Less(i, j int) bool {
+	nameLT := func(ni, nj *ir.Name) bool {
+		oi, foundi := v.paramOrder[ni]
+		oj, foundj := v.paramOrder[nj]
+		if foundi {
+			if foundj {
+				return oi < oj
+			} else {
+				return true
+			}
+		}
+		return false
+	}
+	return nameLT(v.decls[i], v.decls[j])
+}
+
+func (v varsAndDecls) Swap(i, j int) {
+	v.vars[i], v.vars[j] = v.vars[j], v.vars[i]
+	v.decls[i], v.decls[j] = v.decls[j], v.decls[i]
 }
 
 // Given a function that was inlined at some point during the
@@ -264,22 +357,27 @@ func createSimpleVar(fnsym *obj.LSym, n *ir.Name) *dwarf.Var {
 	var abbrev int
 	var offs int64
 
-	switch n.Class {
-	case ir.PPARAM, ir.PPARAMOUT:
-		if !n.IsOutputParamInRegisters() {
-			abbrev = dwarf.DW_ABRV_PARAM
-			offs = n.FrameOffset() + base.Ctxt.FixedFrameSize()
-			break
-		}
-		fallthrough
-	case ir.PAUTO:
+	localAutoOffset := func() int64 {
 		offs = n.FrameOffset()
-		abbrev = dwarf.DW_ABRV_AUTO
-		if base.Ctxt.FixedFrameSize() == 0 {
+		if base.Ctxt.Arch.FixedFrameSize == 0 {
 			offs -= int64(types.PtrSize)
 		}
-		if objabi.FramePointerEnabled {
+		if buildcfg.FramePointerEnabled {
 			offs -= int64(types.PtrSize)
+		}
+		return offs
+	}
+
+	switch n.Class {
+	case ir.PAUTO:
+		offs = localAutoOffset()
+		abbrev = dwarf.DW_ABRV_AUTO
+	case ir.PPARAM, ir.PPARAMOUT:
+		abbrev = dwarf.DW_ABRV_PARAM
+		if n.IsOutputParamInRegisters() {
+			offs = localAutoOffset()
+		} else {
+			offs = n.FrameOffset() + base.Ctxt.Arch.FixedFrameSize
 		}
 
 	default:
@@ -307,10 +405,42 @@ func createSimpleVar(fnsym *obj.LSym, n *ir.Name) *dwarf.Var {
 		Type:          base.Ctxt.Lookup(typename),
 		DeclFile:      declpos.RelFilename(),
 		DeclLine:      declpos.RelLine(),
-		DeclCol:       declpos.Col(),
+		DeclCol:       declpos.RelCol(),
 		InlIndex:      int32(inlIndex),
 		ChildIndex:    -1,
+		DictIndex:     n.DictIndex,
 	}
+}
+
+// createABIVars creates DWARF variables for functions in which the
+// register ABI is enabled but optimization is turned off. It uses a
+// hybrid approach in which register-resident input params are
+// captured with location lists, and all other vars use the "simple"
+// strategy.
+func createABIVars(fnsym *obj.LSym, fn *ir.Func, apDecls []*ir.Name) ([]*ir.Name, []*dwarf.Var, ir.NameSet) {
+
+	// Invoke createComplexVars to generate dwarf vars for input parameters
+	// that are register-allocated according to the ABI rules.
+	decls, vars, selected := createComplexVars(fnsym, fn)
+
+	// Now fill in the remainder of the variables: input parameters
+	// that are not register-resident, output parameters, and local
+	// variables.
+	for _, n := range apDecls {
+		if ir.IsAutoTmp(n) {
+			continue
+		}
+		if _, ok := selected[n]; ok {
+			// already handled
+			continue
+		}
+
+		decls = append(decls, n)
+		vars = append(vars, createSimpleVar(fnsym, n))
+		selected.Add(n)
+	}
+
+	return decls, vars, selected
 }
 
 // createComplexVars creates recomposed DWARF vars with location lists,
@@ -356,7 +486,7 @@ func createComplexVar(fnsym *obj.LSym, fn *ir.Func, varID ssa.VarID) *dwarf.Var 
 
 	gotype := reflectdata.TypeLinksym(n.Type())
 	delete(fnsym.Func().Autot, gotype)
-	typename := dwarf.InfoPrefix + gotype.Name[len("type."):]
+	typename := dwarf.InfoPrefix + gotype.Name[len("type:"):]
 	inlIndex := 0
 	if base.Flag.GenDwarfInl > 1 {
 		if n.InlFormal() || n.InlLocal() {
@@ -380,9 +510,10 @@ func createComplexVar(fnsym *obj.LSym, fn *ir.Func, varID ssa.VarID) *dwarf.Var 
 		StackOffset: ssagen.StackOffset(debug.Slots[debug.VarSlots[varID][0]]),
 		DeclFile:    declpos.RelFilename(),
 		DeclLine:    declpos.RelLine(),
-		DeclCol:     declpos.Col(),
+		DeclCol:     declpos.RelCol(),
 		InlIndex:    int32(inlIndex),
 		ChildIndex:  -1,
+		DictIndex:   n.DictIndex,
 	}
 	list := debug.LocationLists[varID]
 	if len(list) != 0 {
@@ -434,6 +565,14 @@ func RecordFlags(flags ...string) {
 			}
 		}
 		fmt.Fprintf(&cmd, " -%s=%v", f.Name, getter.Get())
+	}
+
+	// Adds flag to producer string signaling whether regabi is turned on or
+	// off.
+	// Once regabi is turned on across the board and the relative GOEXPERIMENT
+	// knobs no longer exist this code should be removed.
+	if buildcfg.Experiment.RegabiArgs {
+		cmd.Write([]byte(" regabi"))
 	}
 
 	if cmd.Len() == 0 {

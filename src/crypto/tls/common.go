@@ -18,11 +18,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"internal/cpu"
 	"io"
 	"net"
-	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -174,11 +171,11 @@ const (
 // hash function associated with the Ed25519 signature scheme.
 var directSigning crypto.Hash = 0
 
-// supportedSignatureAlgorithms contains the signature and hash algorithms that
+// defaultSupportedSignatureAlgorithms contains the signature and hash algorithms that
 // the code advertises as supported in a TLS 1.2+ ClientHello and in a TLS 1.2+
 // CertificateRequest. The two fields are merged to match with TLS 1.3.
 // Note that in TLS 1.2, the ECDSA algorithms are not constrained to P-256, etc.
-var supportedSignatureAlgorithms = []SignatureScheme{
+var defaultSupportedSignatureAlgorithms = []SignatureScheme{
 	PSSWithSHA256,
 	ECDSAWithP256AndSHA256,
 	Ed25519,
@@ -249,6 +246,8 @@ type ConnectionState struct {
 	// On the client side, it can't be empty. On the server side, it can be
 	// empty if Config.ClientAuth is not RequireAnyClientCert or
 	// RequireAndVerifyClientCert.
+	//
+	// PeerCertificates and its contents should not be modified.
 	PeerCertificates []*x509.Certificate
 
 	// VerifiedChains is a list of one or more chains where the first element is
@@ -258,6 +257,8 @@ type ConnectionState struct {
 	// On the client side, it's set if Config.InsecureSkipVerify is false. On
 	// the server side, it's set if Config.ClientAuth is VerifyClientCertIfGiven
 	// (and the peer provided a certificate) or RequireAndVerifyClientCert.
+	//
+	// VerifiedChains and its contents should not be modified.
 	VerifiedChains [][]*x509.Certificate
 
 	// SignedCertificateTimestamps is a list of SCTs provided by the peer
@@ -557,6 +558,8 @@ type Config struct {
 	// If GetCertificate is nil or returns nil, then the certificate is
 	// retrieved from NameToCertificate. If NameToCertificate is nil, the
 	// best element of Certificates will be used.
+	//
+	// Once a Certificate is returned it should not be modified.
 	GetCertificate func(*ClientHelloInfo) (*Certificate, error)
 
 	// GetClientCertificate, if not nil, is called when a server requests a
@@ -572,6 +575,8 @@ type Config struct {
 	//
 	// GetClientCertificate may be called multiple times for the same
 	// connection if renegotiation occurs or if TLS 1.3 is in use.
+	//
+	// Once a Certificate is returned it should not be modified.
 	GetClientCertificate func(*CertificateRequestInfo) (*Certificate, error)
 
 	// GetConfigForClient, if not nil, is called after a ClientHello is
@@ -600,6 +605,8 @@ type Config struct {
 	// setting InsecureSkipVerify, or (for a server) when ClientAuth is
 	// RequestClientCert or RequireAnyClientCert, then this callback will
 	// be considered but the verifiedChains argument will always be nil.
+	//
+	// verifiedChains and its contents should not be modified.
 	VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 
 	// VerifyConnection, if not nil, is called after normal certificate
@@ -618,7 +625,11 @@ type Config struct {
 	RootCAs *x509.CertPool
 
 	// NextProtos is a list of supported application level protocols, in
-	// order of preference.
+	// order of preference. If both peers support ALPN, the selected
+	// protocol will be one from this list, and the connection will fail
+	// if there is no mutually supported protocol. If NextProtos is empty
+	// or the peer doesn't support ALPN, the connection will succeed and
+	// ConnectionState.NegotiatedProtocol will be empty.
 	NextProtos []string
 
 	// ServerName is used to verify the hostname on the returned
@@ -644,17 +655,21 @@ type Config struct {
 	// testing or in combination with VerifyConnection or VerifyPeerCertificate.
 	InsecureSkipVerify bool
 
-	// CipherSuites is a list of supported cipher suites for TLS versions up to
-	// TLS 1.2. If CipherSuites is nil, a default list of secure cipher suites
-	// is used, with a preference order based on hardware performance. The
-	// default cipher suites might change over Go versions. Note that TLS 1.3
-	// ciphersuites are not configurable.
+	// CipherSuites is a list of enabled TLS 1.0–1.2 cipher suites. The order of
+	// the list is ignored. Note that TLS 1.3 ciphersuites are not configurable.
+	//
+	// If CipherSuites is nil, a safe default list is used. The default cipher
+	// suites might change over time.
 	CipherSuites []uint16
 
-	// PreferServerCipherSuites controls whether the server selects the
-	// client's most preferred ciphersuite, or the server's most preferred
-	// ciphersuite. If true then the server's preference, as expressed in
-	// the order of elements in CipherSuites, is used.
+	// PreferServerCipherSuites is a legacy field and has no effect.
+	//
+	// It used to control whether the server would follow the client's or the
+	// server's preference. Servers now select the best mutually supported
+	// cipher suite based on logic that takes into account inferred client
+	// hardware, server hardware, and security.
+	//
+	// Deprecated: PreferServerCipherSuites is ignored.
 	PreferServerCipherSuites bool
 
 	// SessionTicketsDisabled may be set to true to disable session ticket and
@@ -677,11 +692,20 @@ type Config struct {
 	ClientSessionCache ClientSessionCache
 
 	// MinVersion contains the minimum TLS version that is acceptable.
-	// If zero, TLS 1.0 is currently taken as the minimum.
+	//
+	// By default, TLS 1.2 is currently used as the minimum when acting as a
+	// client, and TLS 1.0 when acting as a server. TLS 1.0 is the minimum
+	// supported by this package, both as a client and as a server.
+	//
+	// The client-side default can temporarily be reverted to TLS 1.0 by
+	// including the value "x509sha1=1" in the GODEBUG environment variable.
+	// Note that this option will be removed in Go 1.19 (but it will still be
+	// possible to set this field to VersionTLS10 explicitly).
 	MinVersion uint16
 
 	// MaxVersion contains the maximum TLS version that is acceptable.
-	// If zero, the maximum version supported by this package is used,
+	//
+	// By default, the maximum version supported by this package is used,
 	// which is currently TLS 1.3.
 	MaxVersion uint16
 
@@ -711,7 +735,7 @@ type Config struct {
 
 	// mutex protects sessionTicketKeys and autoSessionTicketKeys.
 	mutex sync.RWMutex
-	// sessionTicketKeys contains zero or more ticket keys. If set, it means the
+	// sessionTicketKeys contains zero or more ticket keys. If set, it means
 	// the keys were set with SessionTicketKey or SetSessionTicketKeys. The
 	// first key is used for new tickets and any subsequent keys can be used to
 	// decrypt old tickets. The slice contents are not protected by the mutex
@@ -946,11 +970,13 @@ func (c *Config) time() time.Time {
 }
 
 func (c *Config) cipherSuites() []uint16 {
-	s := c.CipherSuites
-	if s == nil {
-		s = defaultCipherSuites()
+	if needFIPS() {
+		return fipsCipherSuites(c)
 	}
-	return s
+	if c.CipherSuites != nil {
+		return c.CipherSuites
+	}
+	return defaultCipherSuites
 }
 
 var supportedVersions = []uint16{
@@ -960,9 +986,21 @@ var supportedVersions = []uint16{
 	VersionTLS10,
 }
 
-func (c *Config) supportedVersions() []uint16 {
+// roleClient and roleServer are meant to call supportedVersions and parents
+// with more readability at the callsite.
+const roleClient = true
+const roleServer = false
+
+func (c *Config) supportedVersions(isClient bool) []uint16 {
 	versions := make([]uint16, 0, len(supportedVersions))
 	for _, v := range supportedVersions {
+		if needFIPS() && (v < fipsMinVersion(c) || v > fipsMaxVersion(c)) {
+			continue
+		}
+		if (c == nil || c.MinVersion == 0) &&
+			isClient && v < VersionTLS12 {
+			continue
+		}
 		if c != nil && c.MinVersion != 0 && v < c.MinVersion {
 			continue
 		}
@@ -974,8 +1012,8 @@ func (c *Config) supportedVersions() []uint16 {
 	return versions
 }
 
-func (c *Config) maxSupportedVersion() uint16 {
-	supportedVersions := c.supportedVersions()
+func (c *Config) maxSupportedVersion(isClient bool) uint16 {
+	supportedVersions := c.supportedVersions(isClient)
 	if len(supportedVersions) == 0 {
 		return 0
 	}
@@ -999,6 +1037,9 @@ func supportedVersionsFromMax(maxVersion uint16) []uint16 {
 var defaultCurvePreferences = []CurveID{X25519, CurveP256, CurveP384, CurveP521}
 
 func (c *Config) curvePreferences() []CurveID {
+	if needFIPS() {
+		return fipsCurvePreferences(c)
+	}
 	if c == nil || len(c.CurvePreferences) == 0 {
 		return defaultCurvePreferences
 	}
@@ -1016,8 +1057,8 @@ func (c *Config) supportsCurve(curve CurveID) bool {
 
 // mutualVersion returns the protocol version to use given the advertised
 // versions of the peer. Priority is given to the peer preference order.
-func (c *Config) mutualVersion(peerVersions []uint16) (uint16, bool) {
-	supportedVersions := c.supportedVersions()
+func (c *Config) mutualVersion(isClient bool, peerVersions []uint16) (uint16, bool) {
+	supportedVersions := c.supportedVersions(isClient)
 	for _, peerVersion := range peerVersions {
 		for _, v := range supportedVersions {
 			if v == peerVersion {
@@ -1096,7 +1137,7 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 	if config == nil {
 		config = &Config{}
 	}
-	vers, ok := config.mutualVersion(chi.SupportedVersions)
+	vers, ok := config.mutualVersion(roleServer, chi.SupportedVersions)
 	if !ok {
 		return errors.New("no mutually supported protocol versions")
 	}
@@ -1307,7 +1348,7 @@ func (c *Config) writeKeyLog(label string, clientRandom, secret []byte) error {
 		return nil
 	}
 
-	logLine := []byte(fmt.Sprintf("%s %x %x\n", label, clientRandom, secret))
+	logLine := fmt.Appendf(nil, "%s %x %x\n", label, clientRandom, secret)
 
 	writerMutex.Lock()
 	_, err := c.KeyLogWriter.Write(logLine)
@@ -1440,88 +1481,7 @@ func defaultConfig() *Config {
 	return &emptyConfig
 }
 
-var (
-	once                        sync.Once
-	varDefaultCipherSuites      []uint16
-	varDefaultCipherSuitesTLS13 []uint16
-)
-
-func defaultCipherSuites() []uint16 {
-	once.Do(initDefaultCipherSuites)
-	return varDefaultCipherSuites
-}
-
-func defaultCipherSuitesTLS13() []uint16 {
-	once.Do(initDefaultCipherSuites)
-	return varDefaultCipherSuitesTLS13
-}
-
-var (
-	hasGCMAsmAMD64 = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ
-	hasGCMAsmARM64 = cpu.ARM64.HasAES && cpu.ARM64.HasPMULL
-	// Keep in sync with crypto/aes/cipher_s390x.go.
-	hasGCMAsmS390X = cpu.S390X.HasAES && cpu.S390X.HasAESCBC && cpu.S390X.HasAESCTR && (cpu.S390X.HasGHASH || cpu.S390X.HasAESGCM)
-
-	hasAESGCMHardwareSupport = runtime.GOARCH == "amd64" && hasGCMAsmAMD64 ||
-		runtime.GOARCH == "arm64" && hasGCMAsmARM64 ||
-		runtime.GOARCH == "s390x" && hasGCMAsmS390X
-)
-
-func initDefaultCipherSuites() {
-	var topCipherSuites []uint16
-
-	if hasAESGCMHardwareSupport {
-		// If AES-GCM hardware is provided then prioritise AES-GCM
-		// cipher suites.
-		topCipherSuites = []uint16{
-			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-		}
-		varDefaultCipherSuitesTLS13 = []uint16{
-			TLS_AES_128_GCM_SHA256,
-			TLS_CHACHA20_POLY1305_SHA256,
-			TLS_AES_256_GCM_SHA384,
-		}
-	} else {
-		// Without AES-GCM hardware, we put the ChaCha20-Poly1305
-		// cipher suites first.
-		topCipherSuites = []uint16{
-			TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		}
-		varDefaultCipherSuitesTLS13 = []uint16{
-			TLS_CHACHA20_POLY1305_SHA256,
-			TLS_AES_128_GCM_SHA256,
-			TLS_AES_256_GCM_SHA384,
-		}
-	}
-
-	varDefaultCipherSuites = make([]uint16, 0, len(cipherSuites))
-	varDefaultCipherSuites = append(varDefaultCipherSuites, topCipherSuites...)
-
-NextCipherSuite:
-	for _, suite := range cipherSuites {
-		if suite.flags&suiteDefaultOff != 0 {
-			continue
-		}
-		for _, existing := range varDefaultCipherSuites {
-			if existing == suite.id {
-				continue NextCipherSuite
-			}
-		}
-		varDefaultCipherSuites = append(varDefaultCipherSuites, suite.id)
-	}
-}
-
-func unexpectedMessageError(wanted, got interface{}) error {
+func unexpectedMessageError(wanted, got any) error {
 	return fmt.Errorf("tls: received unexpected handshake message of type %T when waiting for %T", got, wanted)
 }
 
@@ -1532,52 +1492,4 @@ func isSupportedSignatureAlgorithm(sigAlg SignatureScheme, supportedSignatureAlg
 		}
 	}
 	return false
-}
-
-var aesgcmCiphers = map[uint16]bool{
-	// 1.2
-	TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:   true,
-	TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:   true,
-	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: true,
-	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: true,
-	// 1.3
-	TLS_AES_128_GCM_SHA256: true,
-	TLS_AES_256_GCM_SHA384: true,
-}
-
-var nonAESGCMAEADCiphers = map[uint16]bool{
-	// 1.2
-	TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305:   true,
-	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305: true,
-	// 1.3
-	TLS_CHACHA20_POLY1305_SHA256: true,
-}
-
-// aesgcmPreferred returns whether the first valid cipher in the preference list
-// is an AES-GCM cipher, implying the peer has hardware support for it.
-func aesgcmPreferred(ciphers []uint16) bool {
-	for _, cID := range ciphers {
-		c := cipherSuiteByID(cID)
-		if c == nil {
-			c13 := cipherSuiteTLS13ByID(cID)
-			if c13 == nil {
-				continue
-			}
-			return aesgcmCiphers[cID]
-		}
-		return aesgcmCiphers[cID]
-	}
-	return false
-}
-
-// deprioritizeAES reorders cipher preference lists by rearranging
-// adjacent AEAD ciphers such that AES-GCM based ciphers are moved
-// after other AEAD ciphers. It returns a fresh slice.
-func deprioritizeAES(ciphers []uint16) []uint16 {
-	reordered := make([]uint16, len(ciphers))
-	copy(reordered, ciphers)
-	sort.SliceStable(reordered, func(i, j int) bool {
-		return nonAESGCMAEADCiphers[reordered[i]] && aesgcmCiphers[reordered[j]]
-	})
-	return reordered
 }

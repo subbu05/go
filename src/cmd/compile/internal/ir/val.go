@@ -6,7 +6,6 @@ package ir
 
 import (
 	"go/constant"
-	"math"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/types"
@@ -19,28 +18,7 @@ func ConstType(n Node) constant.Kind {
 	return n.Val().Kind()
 }
 
-// ValueInterface returns the constant value stored in n as an interface{}.
-// It returns int64s for ints and runes, float64s for floats,
-// and complex128s for complex values.
-func ConstValue(n Node) interface{} {
-	switch v := n.Val(); v.Kind() {
-	default:
-		base.Fatalf("unexpected constant: %v", v)
-		panic("unreachable")
-	case constant.Bool:
-		return constant.BoolVal(v)
-	case constant.String:
-		return constant.StringVal(v)
-	case constant.Int:
-		return IntVal(n.Type(), v)
-	case constant.Float:
-		return Float64Val(v)
-	case constant.Complex:
-		return complex(Float64Val(constant.Real(v)), Float64Val(constant.Imag(v)))
-	}
-}
-
-// int64Val returns v converted to int64.
+// IntVal returns v converted to int64.
 // Note: if t is uint64, very large values will be converted to negative int64.
 func IntVal(t *types.Type, v constant.Value) int64 {
 	if t.IsUnsigned() {
@@ -56,17 +34,9 @@ func IntVal(t *types.Type, v constant.Value) int64 {
 	panic("unreachable")
 }
 
-func Float64Val(v constant.Value) float64 {
-	if x, _ := constant.Float64Val(v); !math.IsInf(x, 0) {
-		return x + 0 // avoid -0 (should not be needed, but be conservative)
-	}
-	base.Fatalf("bad float64 value: %v", v)
-	panic("unreachable")
-}
-
 func AssertValidTypeForConst(t *types.Type, v constant.Value) {
 	if !ValidTypeForConst(t, v) {
-		base.Fatalf("%v does not represent %v", t, v)
+		base.Fatalf("%v (%v) does not represent %v (%v)", t, t.Kind(), v, v.Kind())
 	}
 }
 
@@ -90,7 +60,7 @@ func ValidTypeForConst(t *types.Type, v constant.Value) bool {
 	panic("unreachable")
 }
 
-// nodlit returns a new untyped constant with value v.
+// NewLiteral returns a new untyped constant with value v.
 func NewLiteral(v constant.Value) Node {
 	return NewBasicLit(base.Pos, v)
 }
@@ -113,18 +83,6 @@ func idealType(ct constant.Kind) *types.Type {
 }
 
 var OKForConst [types.NTYPE]bool
-
-// CanInt64 reports whether it is safe to call Int64Val() on n.
-func CanInt64(n Node) bool {
-	if !IsConst(n, constant.Int) {
-		return false
-	}
-
-	// if the value inside n cannot be represented as an int64, the
-	// return value of Int64 is undefined
-	_, ok := constant.Int64Val(n.Val())
-	return ok
-}
 
 // Int64Val returns n as an int64.
 // n must be an integer or rune constant.

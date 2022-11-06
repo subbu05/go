@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto"
-	"crypto/ed25519/internal/edwards25519"
+	"crypto/internal/boring"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
+	"internal/testenv"
 	"os"
 	"strings"
 	"testing"
@@ -24,24 +26,6 @@ func (zeroReader) Read(buf []byte) (int, error) {
 		buf[i] = 0
 	}
 	return len(buf), nil
-}
-
-func TestUnmarshalMarshal(t *testing.T) {
-	pub, _, _ := GenerateKey(rand.Reader)
-
-	var A edwards25519.ExtendedGroupElement
-	var pubBytes [32]byte
-	copy(pubBytes[:], pub)
-	if !A.FromBytes(&pubBytes) {
-		t.Fatalf("ExtendedGroupElement.FromBytes failed")
-	}
-
-	var pub2 [32]byte
-	A.ToBytes(&pub2)
-
-	if pubBytes != pub2 {
-		t.Errorf("FromBytes(%v)->ToBytes does not round-trip, got %x\n", pubBytes, pub2)
-	}
 }
 
 func TestSignVerify(t *testing.T) {
@@ -57,6 +41,49 @@ func TestSignVerify(t *testing.T) {
 	wrongMessage := []byte("wrong message")
 	if Verify(public, wrongMessage, sig) {
 		t.Errorf("signature of different message accepted")
+	}
+}
+
+func TestSignVerifyHashed(t *testing.T) {
+	// From RFC 8032, Section 7.3
+	key, _ := hex.DecodeString("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf")
+	expectedSig, _ := hex.DecodeString("98a70222f0b8121aa9d30f813d683f809e462b469c7ff87639499bb94e6dae4131f85042463c2a355a2003d062adf5aaa10b8c61e636062aaad11c2a26083406")
+	message, _ := hex.DecodeString("616263")
+
+	private := PrivateKey(key)
+	public := private.Public().(PublicKey)
+	hash := sha512.Sum512(message)
+	sig, err := private.Sign(nil, hash[:], crypto.SHA512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sig, expectedSig) {
+		t.Error("signature doesn't match test vector")
+	}
+	sig, err = private.Sign(nil, hash[:], &Options{Hash: crypto.SHA512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sig, expectedSig) {
+		t.Error("signature doesn't match test vector")
+	}
+	if err := VerifyWithOptions(public, hash[:], sig, &Options{Hash: crypto.SHA512}); err != nil {
+		t.Errorf("valid signature rejected: %v", err)
+	}
+
+	wrongHash := sha512.Sum512([]byte("wrong message"))
+	if VerifyWithOptions(public, wrongHash[:], sig, &Options{Hash: crypto.SHA512}) == nil {
+		t.Errorf("signature of different message accepted")
+	}
+
+	sig[0] ^= 0xff
+	if VerifyWithOptions(public, hash[:], sig, &Options{Hash: crypto.SHA512}) == nil {
+		t.Errorf("invalid signature accepted")
+	}
+	sig[0] ^= 0xff
+	sig[SignatureSize-1] ^= 0xff
+	if VerifyWithOptions(public, hash[:], sig, &Options{Hash: crypto.SHA512}) == nil {
+		t.Errorf("invalid signature accepted")
 	}
 }
 
@@ -81,6 +108,14 @@ func TestCryptoSigner(t *testing.T) {
 	signature, err := signer.Sign(zero, message, noHash)
 	if err != nil {
 		t.Fatalf("error from Sign(): %s", err)
+	}
+
+	signature2, err := signer.Sign(zero, message, &Options{Hash: noHash})
+	if err != nil {
+		t.Fatalf("error from Sign(): %s", err)
+	}
+	if !bytes.Equal(signature, signature2) {
+		t.Errorf("signatures keys do not match")
 	}
 
 	if !Verify(public, message, signature) {
@@ -204,6 +239,26 @@ func TestMalleability(t *testing.T) {
 	}
 }
 
+func TestAllocations(t *testing.T) {
+	if boring.Enabled {
+		t.Skip("skipping allocations test with BoringCrypto")
+	}
+	testenv.SkipIfOptimizationOff(t)
+
+	if allocs := testing.AllocsPerRun(100, func() {
+		seed := make([]byte, SeedSize)
+		message := []byte("Hello, world!")
+		priv := NewKeyFromSeed(seed)
+		pub := priv.Public().(PublicKey)
+		signature := Sign(priv, message)
+		if !Verify(pub, message, signature) {
+			t.Fatal("signature didn't verify")
+		}
+	}); allocs > 0 {
+		t.Errorf("expected zero allocations, got %0.1f", allocs)
+	}
+}
+
 func BenchmarkKeyGeneration(b *testing.B) {
 	var zero zeroReader
 	for i := 0; i < b.N; i++ {
@@ -215,7 +270,6 @@ func BenchmarkKeyGeneration(b *testing.B) {
 
 func BenchmarkNewKeyFromSeed(b *testing.B) {
 	seed := make([]byte, SeedSize)
-	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = NewKeyFromSeed(seed)
 	}
@@ -228,7 +282,6 @@ func BenchmarkSigning(b *testing.B) {
 		b.Fatal(err)
 	}
 	message := []byte("Hello, world!")
-	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		Sign(priv, message)

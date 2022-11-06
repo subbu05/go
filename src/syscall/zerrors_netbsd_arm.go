@@ -5,7 +5,6 @@
 // cgo -godefs -- -marm _const.go
 
 //go:build arm && netbsd
-// +build arm,netbsd
 
 package syscall
 
@@ -1403,6 +1402,7 @@ const (
 	WALTSIG                           = 0x4
 	WCLONE                            = 0x4
 	WCOREFLAG                         = 0x80
+	WEXITED                           = 0x20
 	WNOHANG                           = 0x1
 	WNOWAIT                           = 0x10000
 	WNOZOMBIE                         = 0x20000

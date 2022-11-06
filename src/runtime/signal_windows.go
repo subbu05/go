@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"runtime/internal/sys"
 	"unsafe"
 )
@@ -27,15 +28,15 @@ func firstcontinuetramp()
 func lastcontinuetramp()
 
 func initExceptionHandler() {
-	stdcall2(_AddVectoredExceptionHandler, 1, funcPC(exceptiontramp))
+	stdcall2(_AddVectoredExceptionHandler, 1, abi.FuncPCABI0(exceptiontramp))
 	if _AddVectoredContinueHandler == nil || GOARCH == "386" {
 		// use SetUnhandledExceptionFilter for windows-386 or
 		// if VectoredContinueHandler is unavailable.
 		// note: SetUnhandledExceptionFilter handler won't be called, if debugging.
-		stdcall1(_SetUnhandledExceptionFilter, funcPC(lastcontinuetramp))
+		stdcall1(_SetUnhandledExceptionFilter, abi.FuncPCABI0(lastcontinuetramp))
 	} else {
-		stdcall2(_AddVectoredContinueHandler, 1, funcPC(firstcontinuetramp))
-		stdcall2(_AddVectoredContinueHandler, 0, funcPC(lastcontinuetramp))
+		stdcall2(_AddVectoredContinueHandler, 1, abi.FuncPCABI0(firstcontinuetramp))
+		stdcall2(_AddVectoredContinueHandler, 0, abi.FuncPCABI0(lastcontinuetramp))
 	}
 }
 
@@ -133,7 +134,7 @@ func exceptionhandler(info *exceptionrecord, r *context, gp *g) int32 {
 	// The exception is not from asyncPreempt, so not to push a
 	// sigpanic call to make it look like that. Instead, just
 	// overwrite the PC. (See issue #35773)
-	if r.ip() != 0 && r.ip() != funcPC(asyncPreempt) {
+	if r.ip() != 0 && r.ip() != abi.FuncPCABI0(asyncPreempt) {
 		sp := unsafe.Pointer(r.sp())
 		delta := uintptr(sys.StackAlign)
 		sp = add(sp, -delta)
@@ -145,7 +146,7 @@ func exceptionhandler(info *exceptionrecord, r *context, gp *g) int32 {
 			*((*uintptr)(sp)) = r.ip()
 		}
 	}
-	r.set_ip(funcPC(sigpanic0))
+	r.set_ip(abi.FuncPCABI0(sigpanic0))
 	return _EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -183,39 +184,52 @@ func lastcontinuehandler(info *exceptionrecord, r *context, gp *g) int32 {
 		return _EXCEPTION_CONTINUE_SEARCH
 	}
 
+	// VEH is called before SEH, but arm64 MSVC DLLs use SEH to trap
+	// illegal instructions during runtime initialization to determine
+	// CPU features, so if we make it to the last handler and we're
+	// arm64 and it's an illegal instruction and this is coming from
+	// non-Go code, then assume it's this runtime probing happen, and
+	// pass that onward to SEH.
+	if GOARCH == "arm64" && info.exceptioncode == _EXCEPTION_ILLEGAL_INSTRUCTION &&
+		(r.ip() < firstmoduledata.text || firstmoduledata.etext < r.ip()) {
+		return _EXCEPTION_CONTINUE_SEARCH
+	}
+
 	winthrow(info, r, gp)
 	return 0 // not reached
 }
 
+// Always called on g0. gp is the G where the exception occurred.
+//
 //go:nosplit
 func winthrow(info *exceptionrecord, r *context, gp *g) {
-	_g_ := getg()
+	g0 := getg()
 
-	if panicking != 0 { // traceback already printed
+	if panicking.Load() != 0 { // traceback already printed
 		exit(2)
 	}
-	panicking = 1
+	panicking.Store(1)
 
 	// In case we're handling a g0 stack overflow, blow away the
 	// g0 stack bounds so we have room to print the traceback. If
 	// this somehow overflows the stack, the OS will trap it.
-	_g_.stack.lo = 0
-	_g_.stackguard0 = _g_.stack.lo + _StackGuard
-	_g_.stackguard1 = _g_.stackguard0
+	g0.stack.lo = 0
+	g0.stackguard0 = g0.stack.lo + _StackGuard
+	g0.stackguard1 = g0.stackguard0
 
 	print("Exception ", hex(info.exceptioncode), " ", hex(info.exceptioninformation[0]), " ", hex(info.exceptioninformation[1]), " ", hex(r.ip()), "\n")
 
 	print("PC=", hex(r.ip()), "\n")
-	if _g_.m.lockedg != 0 && _g_.m.ncgo > 0 && gp == _g_.m.g0 {
+	if g0.m.incgo && gp == g0.m.g0 && g0.m.curg != nil {
 		if iscgo {
 			print("signal arrived during external code execution\n")
 		}
-		gp = _g_.m.lockedg.ptr()
+		gp = g0.m.curg
 	}
 	print("\n")
 
-	_g_.m.throwing = 1
-	_g_.m.caughtsig.set(gp)
+	g0.m.throwing = throwTypeRuntime
+	g0.m.caughtsig.set(gp)
 
 	level, _, docrash := gotraceback()
 	if level > 0 {
@@ -232,20 +246,27 @@ func winthrow(info *exceptionrecord, r *context, gp *g) {
 }
 
 func sigpanic() {
-	g := getg()
-	if !canpanic(g) {
+	gp := getg()
+	if !canpanic() {
 		throw("unexpected signal during runtime execution")
 	}
 
-	switch g.sig {
+	switch gp.sig {
 	case _EXCEPTION_ACCESS_VIOLATION:
-		if g.sigcode1 < 0x1000 {
+		if gp.sigcode1 < 0x1000 {
 			panicmem()
 		}
-		if g.paniconfault {
-			panicmemAddr(g.sigcode1)
+		if gp.paniconfault {
+			panicmemAddr(gp.sigcode1)
 		}
-		print("unexpected fault address ", hex(g.sigcode1), "\n")
+		if inUserArenaChunk(gp.sigcode1) {
+			// We could check that the arena chunk is explicitly set to fault,
+			// but the fact that we faulted on accessing it is enough to prove
+			// that it is.
+			print("accessed data from freed user arena ", hex(gp.sigcode1), "\n")
+		} else {
+			print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		}
 		throw("fault")
 	case _EXCEPTION_INT_DIVIDE_BY_ZERO:
 		panicdivide()

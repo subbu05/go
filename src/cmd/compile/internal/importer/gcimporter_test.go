@@ -1,4 +1,3 @@
-// UNREVIEWED
 // Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -9,10 +8,12 @@ import (
 	"bytes"
 	"cmd/compile/internal/types2"
 	"fmt"
+	"go/build"
+	"internal/goexperiment"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,26 +21,26 @@ import (
 	"time"
 )
 
-// skipSpecialPlatforms causes the test to be skipped for platforms where
-// builders (build.golang.org) don't have access to compiled packages for
-// import.
-func skipSpecialPlatforms(t *testing.T) {
-	switch platform := runtime.GOOS + "-" + runtime.GOARCH; platform {
-	case "darwin-arm64":
-		t.Skipf("no compiled packages available for import on %s", platform)
-	}
+func TestMain(m *testing.M) {
+	build.Default.GOROOT = testenv.GOROOT(nil)
+	os.Exit(m.Run())
 }
 
 // compile runs the compiler on filename, with dirname as the working directory,
 // and writes the output file to outdirname.
-func compile(t *testing.T, dirname, filename, outdirname string) string {
+// compile gives the resulting package a packagepath of testdata/<filebasename>.
+func compile(t *testing.T, dirname, filename, outdirname string, packagefiles map[string]string) string {
 	// filename must end with ".go"
-	if !strings.HasSuffix(filename, ".go") {
+	basename, ok := strings.CutSuffix(filepath.Base(filename), ".go")
+	if !ok {
 		t.Fatalf("filename doesn't end in .go: %s", filename)
 	}
-	basename := filepath.Base(filename)
-	outname := filepath.Join(outdirname, basename[:len(basename)-2]+"o")
-	cmd := exec.Command(testenv.GoToolPath(t), "tool", "compile", "-o", outname, filename)
+	objname := basename + ".o"
+	outname := filepath.Join(outdirname, objname)
+	importcfgfile := filepath.Join(outdirname, basename) + ".importcfg"
+	testenv.WriteImportcfg(t, importcfgfile, packagefiles)
+	pkgpath := path.Join("testdata", basename)
+	cmd := exec.Command(testenv.GoToolPath(t), "tool", "compile", "-p", pkgpath, "-D", "testdata", "-importcfg", importcfgfile, "-o", outname, filename)
 	cmd.Dir = dirname
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -63,8 +64,8 @@ func testPath(t *testing.T, path, srcDir string) *types2.Package {
 const maxTime = 30 * time.Second
 
 func testDir(t *testing.T, dir string, endTime time.Time) (nimports int) {
-	dirname := filepath.Join(runtime.GOROOT(), "pkg", runtime.GOOS+"_"+runtime.GOARCH, dir)
-	list, err := ioutil.ReadDir(dirname)
+	dirname := filepath.Join(testenv.GOROOT(t), "pkg", runtime.GOOS+"_"+runtime.GOARCH, dir)
+	list, err := os.ReadDir(dirname)
 	if err != nil {
 		t.Fatalf("testDir(%s): %s", dirname, err)
 	}
@@ -92,7 +93,7 @@ func testDir(t *testing.T, dir string, endTime time.Time) (nimports int) {
 }
 
 func mktmpdir(t *testing.T) string {
-	tmpdir, err := ioutil.TempDir("", "gcimporter_test")
+	tmpdir, err := os.MkdirTemp("", "gcimporter_test")
 	if err != nil {
 		t.Fatal("mktmpdir:", err)
 	}
@@ -109,32 +110,42 @@ func TestImportTestdata(t *testing.T) {
 		t.Skipf("gc-built packages not available (compiler = %s)", runtime.Compiler)
 	}
 
-	tmpdir := mktmpdir(t)
-	defer os.RemoveAll(tmpdir)
+	testenv.MustHaveGoBuild(t)
 
-	compile(t, "testdata", "exports.go", filepath.Join(tmpdir, "testdata"))
+	testfiles := map[string][]string{
+		"exports.go":  {"go/ast", "go/token"},
+		"generics.go": nil,
+	}
+	if goexperiment.Unified {
+		// TODO(mdempsky): Fix test below to flatten the transitive
+		// Package.Imports graph. Unified IR is more precise about
+		// recreating the package import graph.
+		testfiles["exports.go"] = []string{"go/ast"}
+	}
 
-	if pkg := testPath(t, "./testdata/exports", tmpdir); pkg != nil {
-		// The package's Imports list must include all packages
-		// explicitly imported by exports.go, plus all packages
-		// referenced indirectly via exported objects in exports.go.
-		// With the textual export format, the list may also include
-		// additional packages that are not strictly required for
-		// import processing alone (they are exported to err "on
-		// the safe side").
-		// TODO(gri) update the want list to be precise, now that
-		// the textual export data is gone.
-		got := fmt.Sprint(pkg.Imports())
-		for _, want := range []string{"go/ast", "go/token"} {
-			if !strings.Contains(got, want) {
-				t.Errorf(`Package("exports").Imports() = %s, does not contain %s`, got, want)
+	for testfile, wantImports := range testfiles {
+		tmpdir := mktmpdir(t)
+		defer os.RemoveAll(tmpdir)
+
+		compile(t, "testdata", testfile, filepath.Join(tmpdir, "testdata"), nil)
+		path := "./testdata/" + strings.TrimSuffix(testfile, ".go")
+
+		if pkg := testPath(t, path, tmpdir); pkg != nil {
+			// The package's Imports list must include all packages
+			// explicitly imported by testfile, plus all packages
+			// referenced indirectly via exported objects in testfile.
+			got := fmt.Sprint(pkg.Imports())
+			for _, want := range wantImports {
+				if !strings.Contains(got, want) {
+					t.Errorf(`Package("exports").Imports() = %s, does not contain %s`, got, want)
+				}
 			}
 		}
 	}
 }
 
 func TestVersionHandling(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -142,7 +153,7 @@ func TestVersionHandling(t *testing.T) {
 	}
 
 	const dir = "./testdata/versions"
-	list, err := ioutil.ReadDir(dir)
+	list, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +206,7 @@ func TestVersionHandling(t *testing.T) {
 
 		// create file with corrupted export data
 		// 1) read file
-		data, err := ioutil.ReadFile(filepath.Join(dir, name))
+		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,7 +223,7 @@ func TestVersionHandling(t *testing.T) {
 		// 4) write the file
 		pkgpath += "_corrupted"
 		filename := filepath.Join(corruptdir, pkgpath) + ".a"
-		ioutil.WriteFile(filename, data, 0666)
+		os.WriteFile(filename, data, 0666)
 
 		// test that importing the corrupted file results in an error
 		_, err = Import(make(map[string]*types2.Package), pkgpath, corruptdir, nil)
@@ -225,7 +236,7 @@ func TestVersionHandling(t *testing.T) {
 }
 
 func TestImportStdLib(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -255,18 +266,17 @@ var importedObjectTests = []struct {
 	{"go/internal/gcimporter.FindPkg", "func FindPkg(path string, srcDir string) (filename string, id string)"},
 
 	// interfaces
-	{"context.Context", "type Context interface{Deadline() (deadline time.Time, ok bool); Done() <-chan struct{}; Err() error; Value(key interface{}) interface{}}"},
+	{"context.Context", "type Context interface{Deadline() (deadline time.Time, ok bool); Done() <-chan struct{}; Err() error; Value(key any) any}"},
 	{"crypto.Decrypter", "type Decrypter interface{Decrypt(rand io.Reader, msg []byte, opts DecrypterOpts) (plaintext []byte, err error); Public() PublicKey}"},
 	{"encoding.BinaryMarshaler", "type BinaryMarshaler interface{MarshalBinary() (data []byte, err error)}"},
 	{"io.Reader", "type Reader interface{Read(p []byte) (n int, err error)}"},
 	{"io.ReadWriter", "type ReadWriter interface{Reader; Writer}"},
 	{"go/ast.Node", "type Node interface{End() go/token.Pos; Pos() go/token.Pos}"},
-	// go/types.Type has grown much larger - excluded for now
-	// {"go/types.Type", "type Type interface{String() string; Underlying() Type}"},
+	{"go/types.Type", "type Type interface{String() string; Underlying() Type}"},
 }
 
 func TestImportedTypes(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -318,6 +328,14 @@ func verifyInterfaceMethodRecvs(t *testing.T, named *types2.Named, level int) {
 		return // not an interface
 	}
 
+	// The unified IR importer always sets interface method receiver
+	// parameters to point to the Interface type, rather than the Named.
+	// See #49906.
+	var want types2.Type = named
+	if goexperiment.Unified {
+		want = iface
+	}
+
 	// check explicitly declared methods
 	for i := 0; i < iface.NumExplicitMethods(); i++ {
 		m := iface.ExplicitMethod(i)
@@ -326,7 +344,7 @@ func verifyInterfaceMethodRecvs(t *testing.T, named *types2.Named, level int) {
 			t.Errorf("%s: missing receiver type", m)
 			continue
 		}
-		if recv.Type() != named {
+		if recv.Type() != want {
 			t.Errorf("%s: got recv type %s; want %s", m, recv.Type(), named)
 		}
 	}
@@ -341,7 +359,7 @@ func verifyInterfaceMethodRecvs(t *testing.T, named *types2.Named, level int) {
 }
 
 func TestIssue5815(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -370,7 +388,7 @@ func TestIssue5815(t *testing.T) {
 
 // Smoke test to ensure that imported methods get the correct package.
 func TestCorrectMethodPackage(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -392,7 +410,7 @@ func TestCorrectMethodPackage(t *testing.T) {
 }
 
 func TestIssue13566(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -416,8 +434,8 @@ func TestIssue13566(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	compile(t, "testdata", "a.go", testoutdir)
-	compile(t, testoutdir, bpath, testoutdir)
+	compile(t, "testdata", "a.go", testoutdir, nil)
+	compile(t, testoutdir, bpath, testoutdir, map[string]string{"testdata/a": filepath.Join(testoutdir, "a.o")})
 
 	// import must succeed (test for issue at hand)
 	pkg := importPkg(t, "./testdata/b", tmpdir)
@@ -431,7 +449,7 @@ func TestIssue13566(t *testing.T) {
 }
 
 func TestIssue13898(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -457,17 +475,17 @@ func TestIssue13898(t *testing.T) {
 		t.Fatal("go/types not found")
 	}
 
-	// look for go/types2.Object type
+	// look for go/types.Object type
 	obj := lookupObj(t, goTypesPkg.Scope(), "Object")
 	typ, ok := obj.Type().(*types2.Named)
 	if !ok {
-		t.Fatalf("go/types2.Object type is %v; wanted named type", typ)
+		t.Fatalf("go/types.Object type is %v; wanted named type", typ)
 	}
 
-	// lookup go/types2.Object.Pkg method
+	// lookup go/types.Object.Pkg method
 	m, index, indirect := types2.LookupFieldOrMethod(typ, false, nil, "Pkg")
 	if m == nil {
-		t.Fatalf("go/types2.Object.Pkg not found (index = %v, indirect = %v)", index, indirect)
+		t.Fatalf("go/types.Object.Pkg not found (index = %v, indirect = %v)", index, indirect)
 	}
 
 	// the method must belong to go/types
@@ -477,7 +495,7 @@ func TestIssue13898(t *testing.T) {
 }
 
 func TestIssue15517(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -493,7 +511,7 @@ func TestIssue15517(t *testing.T) {
 	tmpdir := mktmpdir(t)
 	defer os.RemoveAll(tmpdir)
 
-	compile(t, "testdata", "p.go", filepath.Join(tmpdir, "testdata"))
+	compile(t, "testdata", "p.go", filepath.Join(tmpdir, "testdata"), nil)
 
 	// Multiple imports of p must succeed without redeclaration errors.
 	// We use an import path that's not cleaned up so that the eventual
@@ -516,7 +534,7 @@ func TestIssue15517(t *testing.T) {
 }
 
 func TestIssue15920(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -533,7 +551,7 @@ func TestIssue15920(t *testing.T) {
 }
 
 func TestIssue20046(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -554,7 +572,7 @@ func TestIssue20046(t *testing.T) {
 	}
 }
 func TestIssue25301(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -571,7 +589,7 @@ func TestIssue25301(t *testing.T) {
 }
 
 func TestIssue25596(t *testing.T) {
-	skipSpecialPlatforms(t)
+	testenv.MustHaveGoBuild(t)
 
 	// This package only handles gc export data.
 	if runtime.Compiler != "gc" {
@@ -598,7 +616,7 @@ func importPkg(t *testing.T, path, srcDir string) *types2.Package {
 func compileAndImportPkg(t *testing.T, name string) *types2.Package {
 	tmpdir := mktmpdir(t)
 	defer os.RemoveAll(tmpdir)
-	compile(t, "testdata", name+".go", filepath.Join(tmpdir, "testdata"))
+	compile(t, "testdata", name+".go", filepath.Join(tmpdir, "testdata"), nil)
 	return importPkg(t, "./testdata/"+name, tmpdir)
 }
 

@@ -3,11 +3,12 @@
 // license that can be found in the LICENSE file.
 
 //go:build aix
-// +build aix
 
 package runtime
 
 import (
+	"internal/abi"
+	"runtime/internal/atomic"
 	"unsafe"
 )
 
@@ -48,7 +49,7 @@ func semacreate(mp *m) {
 
 //go:nosplit
 func semasleep(ns int64) int32 {
-	_m_ := getg().m
+	mp := getg().m
 	if ns >= 0 {
 		var ts timespec
 
@@ -62,17 +63,17 @@ func semasleep(ns int64) int32 {
 			ts.tv_nsec -= 1e9
 		}
 
-		if r, err := sem_timedwait((*semt)(unsafe.Pointer(_m_.waitsema)), &ts); r != 0 {
+		if r, err := sem_timedwait((*semt)(unsafe.Pointer(mp.waitsema)), &ts); r != 0 {
 			if err == _ETIMEDOUT || err == _EAGAIN || err == _EINTR {
 				return -1
 			}
-			println("sem_timedwait err ", err, " ts.tv_sec ", ts.tv_sec, " ts.tv_nsec ", ts.tv_nsec, " ns ", ns, " id ", _m_.id)
+			println("sem_timedwait err ", err, " ts.tv_sec ", ts.tv_sec, " ts.tv_nsec ", ts.tv_nsec, " ns ", ns, " id ", mp.id)
 			throw("sem_timedwait")
 		}
 		return 0
 	}
 	for {
-		r1, err := sem_wait((*semt)(unsafe.Pointer(_m_.waitsema)))
+		r1, err := sem_wait((*semt)(unsafe.Pointer(mp.waitsema)))
 		if r1 == 0 {
 			break
 		}
@@ -150,6 +151,7 @@ var failthreadcreate = []byte("runtime: failed to create new OS thread\n")
 // Called to do synchronous initialization of Go code built with
 // -buildmode=c-archive or -buildmode=c-shared.
 // None of the Go runtime is initialized.
+//
 //go:nosplit
 //go:nowritebarrierrec
 func libpreinit() {
@@ -232,7 +234,7 @@ func newosproc(mp *m) {
 
 }
 
-func exitThread(wait *uint32) {
+func exitThread(wait *atomic.Uint32) {
 	// We should never reach exitThread on AIX because we let
 	// libc clean up threads.
 	throw("exitThread")
@@ -267,7 +269,7 @@ func setsig(i uint32, fn uintptr) {
 	var sa sigactiont
 	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
 	sa.sa_mask = sigset_all
-	if fn == funcPC(sighandler) {
+	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
 		fn = uintptr(unsafe.Pointer(&sigtramp))
 	}
 	sa.sa_handler = fn
@@ -295,7 +297,8 @@ func getsig(i uint32) uintptr {
 	return sa.sa_handler
 }
 
-// setSignaltstackSP sets the ss_sp field of a stackt.
+// setSignalstackSP sets the ss_sp field of a stackt.
+//
 //go:nosplit
 func setSignalstackSP(s *stackt, sp uintptr) {
 	*(*uintptr)(unsafe.Pointer(&s.ss_sp)) = sp
@@ -322,6 +325,19 @@ func sigdelset(mask *sigset, i int) {
 	(*mask)[(i-1)/64] &^= 1 << ((uint32(i) - 1) & 63)
 }
 
+func setProcessCPUProfiler(hz int32) {
+	setProcessCPUProfilerTimer(hz)
+}
+
+func setThreadCPUProfiler(hz int32) {
+	setThreadCPUProfilerHz(hz)
+}
+
+//go:nosplit
+func validSIGPROF(mp *m, c *sigctxt) bool {
+	return true
+}
+
 const (
 	_CLOCK_REALTIME  = 9
 	_CLOCK_MONOTONIC = 10
@@ -336,7 +352,7 @@ func nanotime1() int64 {
 	return tp.tv_sec*1000000000 + tp.tv_nsec
 }
 
-func walltime1() (sec int64, nsec int32) {
+func walltime() (sec int64, nsec int32) {
 	ts := &timespec{}
 	if clock_gettime(_CLOCK_REALTIME, ts) != 0 {
 		throw("syscall clock_gettime failed")
@@ -359,4 +375,13 @@ func closeonexec(fd int32) {
 func setNonblock(fd int32) {
 	flags := fcntl(fd, _F_GETFL, 0)
 	fcntl(fd, _F_SETFL, flags|_O_NONBLOCK)
+}
+
+// sigPerThreadSyscall is only used on linux, so we assign a bogus signal
+// number.
+const sigPerThreadSyscall = 1 << 31
+
+//go:nosplit
+func runPerThreadSyscall() {
+	throw("runPerThreadSyscall only valid on linux")
 }

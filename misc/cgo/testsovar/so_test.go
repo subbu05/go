@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build cgo
 // +build cgo
 
 package so_test
@@ -79,6 +80,10 @@ func TestSO(t *testing.T) {
 	case "windows":
 		ext = "dll"
 		args = append(args, "-DEXPORT_DLL")
+		// At least in mingw-clang it is not permitted to just name a .dll
+		// on the command line. You must name the corresponding import
+		// library instead, even though the dll is used when the executable is run.
+		args = append(args, "-Wl,-out-implib,libcgosotest.a")
 	case "aix":
 		ext = "so.1"
 	}

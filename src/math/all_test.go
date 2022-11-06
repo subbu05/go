@@ -1631,8 +1631,8 @@ var vfpowSC = [][2]float64{
 	{-1, Inf(-1)},
 	{-1, Inf(1)},
 	{-1, NaN()},
-	{-1 / 2, Inf(-1)},
-	{-1 / 2, Inf(1)},
+	{-0.5, Inf(-1)},
+	{-0.5, Inf(1)},
 	{Copysign(0, -1), Inf(-1)},
 	{Copysign(0, -1), -Pi},
 	{Copysign(0, -1), -0.5},
@@ -1652,8 +1652,8 @@ var vfpowSC = [][2]float64{
 	{0, Inf(1)},
 	{0, NaN()},
 
-	{1 / 2, Inf(-1)},
-	{1 / 2, Inf(1)},
+	{0.5, Inf(-1)},
+	{0.5, Inf(1)},
 	{1, Inf(-1)},
 	{1, Inf(1)},
 	{1, NaN()},
@@ -1681,8 +1681,8 @@ var vfpowSC = [][2]float64{
 	{2, float64(1 << 32)},
 	{2, -float64(1 << 32)},
 	{-2, float64(1<<32 + 1)},
-	{1 / 2, float64(1 << 45)},
-	{1 / 2, -float64(1 << 45)},
+	{0.5, float64(1 << 45)},
+	{0.5, -float64(1 << 45)},
 	{Nextafter(1, 2), float64(1 << 63)},
 	{Nextafter(1, -2), float64(1 << 63)},
 	{Nextafter(-1, 2), float64(1 << 63)},
@@ -3175,7 +3175,7 @@ func TestTrigReduce(t *testing.T) {
 // https://golang.org/issue/201
 
 type floatTest struct {
-	val  interface{}
+	val  any
 	name string
 	str  string
 }
@@ -3193,6 +3193,15 @@ func TestFloatMinMax(t *testing.T) {
 		if s != tt.str {
 			t.Errorf("Sprint(%v) = %s, want %s", tt.name, s, tt.str)
 		}
+	}
+}
+
+func TestFloatMinima(t *testing.T) {
+	if q := float32(SmallestNonzeroFloat32 / 2); q != 0 {
+		t.Errorf("float32(SmallestNonzeroFloat32 / 2) = %g, want 0", q)
+	}
+	if q := float64(SmallestNonzeroFloat64 / 2); q != 0 {
+		t.Errorf("float64(SmallestNonzeroFloat64 / 2) = %g, want 0", q)
 	}
 }
 

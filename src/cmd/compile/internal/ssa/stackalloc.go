@@ -25,8 +25,6 @@ type stackAllocState struct {
 	values    []stackValState
 	interfere [][]ID // interfere[v.id] = values that interfere with v.
 	names     []LocalSlot
-	slots     []int
-	used      []bool
 
 	nArgSlot, // Number of Values sourced to arg slot
 	nNotNeed, // Number of Values not needing a stack slot
@@ -56,12 +54,6 @@ func putStackAllocState(s *stackAllocState) {
 	}
 	for i := range s.names {
 		s.names[i] = LocalSlot{}
-	}
-	for i := range s.slots {
-		s.slots[i] = 0
-	}
-	for i := range s.used {
-		s.used[i] = false
 	}
 	s.f.Cache.stackAllocState = s
 	s.f = nil
@@ -141,11 +133,34 @@ func (s *stackAllocState) stackalloc() {
 		s.names = make([]LocalSlot, n)
 	}
 	names := s.names
+	empty := LocalSlot{}
 	for _, name := range f.Names {
 		// Note: not "range f.NamedValues" above, because
 		// that would be nondeterministic.
-		for _, v := range f.NamedValues[name] {
-			names[v.ID] = name
+		for _, v := range f.NamedValues[*name] {
+			if v.Op == OpArgIntReg || v.Op == OpArgFloatReg {
+				aux := v.Aux.(*AuxNameOffset)
+				// Never let an arg be bound to a differently named thing.
+				if name.N != aux.Name || name.Off != aux.Offset {
+					if f.pass.debug > stackDebug {
+						fmt.Printf("stackalloc register arg %s skipping name %s\n", v, name)
+					}
+					continue
+				}
+			} else if name.N.Class == ir.PPARAM && v.Op != OpArg {
+				// PPARAM's only bind to OpArg
+				if f.pass.debug > stackDebug {
+					fmt.Printf("stackalloc PPARAM name %s skipping non-Arg %s\n", name, v)
+				}
+				continue
+			}
+
+			if names[v.ID] == empty {
+				if f.pass.debug > stackDebug {
+					fmt.Printf("stackalloc value %s to name %s\n", v, *name)
+				}
+				names[v.ID] = *name
+			}
 		}
 	}
 
@@ -165,15 +180,25 @@ func (s *stackAllocState) stackalloc() {
 			f.setHome(v, loc)
 			continue
 		}
+		// You might think this below would be the right idea, but you would be wrong.
+		// It almost works; as of 105a6e9518 - 2021-04-23,
+		// GOSSAHASH=11011011001011111 == cmd/compile/internal/noder.(*noder).embedded
+		// is compiled incorrectly.  I believe the cause is one of those SSA-to-registers
+		// puzzles that the register allocator untangles; in the event that a register
+		// parameter does not end up bound to a name, "fixing" it is a bad idea.
+		//
+		//if f.DebugTest {
+		//	if v.Op == OpArgIntReg || v.Op == OpArgFloatReg {
+		//		aux := v.Aux.(*AuxNameOffset)
+		//		loc := LocalSlot{N: aux.Name, Type: v.Type, Off: aux.Offset}
+		//		if f.pass.debug > stackDebug {
+		//			fmt.Printf("stackalloc Op%s %s to %s\n", v.Op, v, loc)
+		//		}
+		//		names[v.ID] = loc
+		//		continue
+		//	}
+		//}
 
-		nameOff := v.Aux.(*AuxNameOffset)
-		loc := LocalSlot{N: nameOff.Name, Type: v.Type, Off: nameOff.Offset}
-		if f.pass.debug > stackDebug {
-			fmt.Printf("stackalloc Op%s %s to %s\n", v.Op, v, loc)
-		}
-		// register args already allocated to registers, but need to know the stack allocation for later
-		reg := f.getHome(v.ID).(*Register)
-		f.RegArgs = append(f.RegArgs, ArgPair{reg: reg, mem: loc})
 	}
 
 	// For each type, we keep track of all the stack slots we
@@ -185,25 +210,15 @@ func (s *stackAllocState) stackalloc() {
 
 	// Each time we assign a stack slot to a value v, we remember
 	// the slot we used via an index into locations[v.Type].
-	slots := s.slots
-	if n := f.NumValues(); cap(slots) >= n {
-		slots = slots[:n]
-	} else {
-		slots = make([]int, n)
-		s.slots = slots
-	}
+	slots := f.Cache.allocIntSlice(f.NumValues())
+	defer f.Cache.freeIntSlice(slots)
 	for i := range slots {
 		slots[i] = -1
 	}
 
 	// Pick a stack slot for each value needing one.
-	var used []bool
-	if n := f.NumValues(); cap(s.used) >= n {
-		used = s.used[:n]
-	} else {
-		used = make([]bool, n)
-		s.used = used
-	}
+	used := f.Cache.allocBoolSlice(f.NumValues())
+	defer f.Cache.freeBoolSlice(used)
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			if !s.values[v.ID].needSlot {

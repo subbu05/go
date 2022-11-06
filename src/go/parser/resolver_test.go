@@ -7,7 +7,6 @@ package parser
 import (
 	"fmt"
 	"go/ast"
-	"go/internal/typeparams"
 	"go/scanner"
 	"go/token"
 	"os"
@@ -41,13 +40,6 @@ func TestResolution(t *testing.T) {
 			path := filepath.Join(dir, fi.Name())
 			src := readFile(path) // panics on failure
 			var mode Mode
-			if strings.HasSuffix(path, ".go2") {
-				if !typeparams.Enabled {
-					t.Skip("type params are not enabled")
-				}
-			} else {
-				mode |= typeparams.DisallowParsing
-			}
 			file, err := ParseFile(fset, path, src, mode)
 			if err != nil {
 				t.Fatal(err)
@@ -86,7 +78,8 @@ func TestResolution(t *testing.T) {
 func declsFromParser(file *ast.File) map[token.Pos]token.Pos {
 	objmap := map[token.Pos]token.Pos{}
 	ast.Inspect(file, func(node ast.Node) bool {
-		if ident, _ := node.(*ast.Ident); ident != nil && ident.Obj != nil {
+		// Ignore blank identifiers to reduce noise.
+		if ident, _ := node.(*ast.Ident); ident != nil && ident.Obj != nil && ident.Name != "_" {
 			objmap[ident.Pos()] = ident.Obj.Pos()
 		}
 		return true

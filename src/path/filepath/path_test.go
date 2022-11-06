@@ -93,6 +93,9 @@ var wincleantests = []PathTest{
 	{`//host/share/foo/../baz`, `\\host\share\baz`},
 	{`\\a\b\..\c`, `\\a\b\c`},
 	{`\\a\b`, `\\a\b`},
+	{`.\c:`, `.\c:`},
+	{`.\c:\foo`, `.\c:\foo`},
+	{`.\c:foo`, `.\c:foo`},
 }
 
 func TestClean(t *testing.T) {
@@ -635,6 +638,64 @@ func TestWalkSkipDirOnFile(t *testing.T) {
 	})
 }
 
+func TestWalkSkipAllOnFile(t *testing.T) {
+	td := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(td, "dir", "subdir"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(td, "dir2"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	touch(t, filepath.Join(td, "dir", "foo1"))
+	touch(t, filepath.Join(td, "dir", "foo2"))
+	touch(t, filepath.Join(td, "dir", "subdir", "foo3"))
+	touch(t, filepath.Join(td, "dir", "foo4"))
+	touch(t, filepath.Join(td, "dir2", "bar"))
+	touch(t, filepath.Join(td, "last"))
+
+	remainingWereSkipped := true
+	walker := func(path string) error {
+		if strings.HasSuffix(path, "foo2") {
+			return filepath.SkipAll
+		}
+
+		if strings.HasSuffix(path, "foo3") ||
+			strings.HasSuffix(path, "foo4") ||
+			strings.HasSuffix(path, "bar") ||
+			strings.HasSuffix(path, "last") {
+			remainingWereSkipped = false
+		}
+		return nil
+	}
+
+	walkFn := func(path string, _ fs.FileInfo, _ error) error { return walker(path) }
+	walkDirFn := func(path string, _ fs.DirEntry, _ error) error { return walker(path) }
+
+	check := func(t *testing.T, walk func(root string) error, root string) {
+		t.Helper()
+		remainingWereSkipped = true
+		if err := walk(root); err != nil {
+			t.Fatal(err)
+		}
+		if !remainingWereSkipped {
+			t.Errorf("SkipAll on file foo2 did not block processing of remaining files and directories")
+		}
+	}
+
+	t.Run("Walk", func(t *testing.T) {
+		Walk := func(_ string) error { return filepath.Walk(td, walkFn) }
+		check(t, Walk, td)
+		check(t, Walk, filepath.Join(td, "dir"))
+	})
+	t.Run("WalkDir", func(t *testing.T) {
+		WalkDir := func(_ string) error { return filepath.WalkDir(td, walkDirFn) }
+		check(t, WalkDir, td)
+		check(t, WalkDir, filepath.Join(td, "dir"))
+	})
+}
+
 func TestWalkFileError(t *testing.T) {
 	td := t.TempDir()
 
@@ -791,6 +852,8 @@ var winisabstests = []IsAbsTest{
 	{`c:a\b`, false},
 	{`c:\a\b`, true},
 	{`c:/a/b`, true},
+	{`\\host\share`, true},
+	{`\\host\share\`, true},
 	{`\\host\share\foo`, true},
 	{`//host/share/foo/bar`, true},
 }
@@ -1327,7 +1390,7 @@ func TestBug3486(t *testing.T) { // https://golang.org/issue/3486
 	if runtime.GOOS == "ios" {
 		t.Skipf("skipping on %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
-	root, err := filepath.EvalSymlinks(runtime.GOROOT() + "/test")
+	root, err := filepath.EvalSymlinks(testenv.GOROOT(t) + "/test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,11 +1532,16 @@ func TestEvalSymlinksAboveRoot(t *testing.T) {
 	// Try different numbers of "..".
 	for _, i := range []int{c, c + 1, c + 2} {
 		check := strings.Join([]string{evalTmpDir, strings.Join(dd[:i], string(os.PathSeparator)), evalTmpDir[len(vol)+1:], "b", "file"}, string(os.PathSeparator))
-		if resolved, err := filepath.EvalSymlinks(check); err != nil {
+		resolved, err := filepath.EvalSymlinks(check)
+		switch {
+		case runtime.GOOS == "darwin" && errors.Is(err, fs.ErrNotExist):
+			// On darwin, the temp dir is sometimes cleaned up mid-test (issue 37910).
+			testenv.SkipFlaky(t, 37910)
+		case err != nil:
 			t.Errorf("EvalSymlinks(%q) failed: %v", check, err)
-		} else if !strings.HasSuffix(resolved, wantSuffix) {
+		case !strings.HasSuffix(resolved, wantSuffix):
 			t.Errorf("EvalSymlinks(%q) = %q does not end with %q", check, resolved, wantSuffix)
-		} else {
+		default:
 			t.Logf("EvalSymlinks(%q) = %q", check, resolved)
 		}
 	}
@@ -1517,5 +1585,40 @@ func TestEvalSymlinksAboveRootChdir(t *testing.T) {
 		t.Errorf("EvalSymlinks(%q) = %q does not end with %q", check, resolved, wantSuffix)
 	} else {
 		t.Logf("EvalSymlinks(%q) = %q", check, resolved)
+	}
+}
+
+func TestIssue51617(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"a", filepath.Join("a", "bad"), filepath.Join("a", "next")} {
+		if err := os.Mkdir(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bad := filepath.Join(dir, "a", "bad")
+	if err := os.Chmod(bad, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(bad, 0700) // avoid errors on cleanup
+	var saw []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			saw = append(saw, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{".", "a", filepath.Join("a", "bad"), filepath.Join("a", "next")}
+	if !reflect.DeepEqual(saw, want) {
+		t.Errorf("got directories %v, want %v", saw, want)
 	}
 }

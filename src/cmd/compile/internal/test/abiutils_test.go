@@ -14,6 +14,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/obj/x86"
 	"cmd/internal/src"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -32,6 +33,8 @@ func TestMain(m *testing.M) {
 	base.Ctxt.DiagFunc = base.Errorf
 	base.Ctxt.DiagFlush = base.FlushErrors
 	base.Ctxt.Bso = bufio.NewWriter(os.Stdout)
+	types.LocalPkg = types.NewPkg("p", "local")
+	types.LocalPkg.Prefix = "p"
 	types.PtrSize = ssagen.Arch.LinkArch.PtrSize
 	types.RegSize = ssagen.Arch.LinkArch.RegSize
 	typecheck.InitUniverse()
@@ -244,7 +247,7 @@ func TestABIUtilsSliceString(t *testing.T) {
 	//      p6 int64, p6 []intr32) (r1 string, r2 int64, r3 string, r4 []int32)
 	i32 := types.Types[types.TINT32]
 	sli32 := types.NewSlice(i32)
-	str := types.New(types.TSTRING)
+	str := types.Types[types.TSTRING]
 	i8 := types.Types[types.TINT8]
 	i64 := types.Types[types.TINT64]
 	ft := mkFuncType(nil, []*types.Type{sli32, i8, sli32, i8, str, i8, i64, sli32},
@@ -308,9 +311,9 @@ func TestABIUtilsInterfaces(t *testing.T) {
 	ei := types.Types[types.TINTER] // interface{}
 	pei := types.NewPtr(ei)         // *interface{}
 	fldt := mkFuncType(types.FakeRecvType(), []*types.Type{},
-		[]*types.Type{types.UntypedString})
-	field := types.NewField(src.NoXPos, nil, fldt)
-	nei := types.NewInterface(types.LocalPkg, []*types.Field{field})
+		[]*types.Type{types.Types[types.TSTRING]})
+	field := types.NewField(src.NoXPos, typecheck.Lookup("F"), fldt)
+	nei := types.NewInterface(types.LocalPkg, []*types.Field{field}, false)
 	i16 := types.Types[types.TINT16]
 	tb := types.Types[types.TBOOL]
 	s1 := mkstruct([]*types.Type{i16, i16, tb})
@@ -321,12 +324,12 @@ func TestABIUtilsInterfaces(t *testing.T) {
         IN 0: R{ I0 I1 I2 } spilloffset: 0 typ: struct { int16; int16; bool }
         IN 1: R{ I3 I4 } spilloffset: 8 typ: interface {}
         IN 2: R{ I5 I6 } spilloffset: 24 typ: interface {}
-        IN 3: R{ I7 I8 } spilloffset: 40 typ: interface { () untyped string }
+        IN 3: R{ I7 I8 } spilloffset: 40 typ: interface { F() string }
         IN 4: R{ } offset: 0 typ: *interface {}
-        IN 5: R{ } offset: 8 typ: interface { () untyped string }
+        IN 5: R{ } offset: 8 typ: interface { F() string }
         IN 6: R{ } offset: 24 typ: int16
         OUT 0: R{ I0 I1 } spilloffset: -1 typ: interface {}
-        OUT 1: R{ I2 I3 } spilloffset: -1 typ: interface { () untyped string }
+        OUT 1: R{ I2 I3 } spilloffset: -1 typ: interface { F() string }
         OUT 2: R{ I4 } spilloffset: -1 typ: *interface {}
         offsetToSpillArea: 32 spillAreaSize: 56
 `)
@@ -358,4 +361,39 @@ func TestABINumParamRegs(t *testing.T) {
 	nrtest(t, s, 4)
 	nrtest(t, a, 12)
 
+}
+
+func TestABIUtilsComputePadding(t *testing.T) {
+	// type s1 { f1 int8; f2 int16; f3 struct{}; f4 int32; f5 int64 }
+	i8 := types.Types[types.TINT8]
+	i16 := types.Types[types.TINT16]
+	i32 := types.Types[types.TINT32]
+	i64 := types.Types[types.TINT64]
+	emptys := mkstruct([]*types.Type{})
+	s1 := mkstruct([]*types.Type{i8, i16, emptys, i32, i64})
+	// func (p1 int32, p2 s1, p3 emptys, p4 [1]int32)
+	a1 := types.NewArray(i32, 1)
+	ft := mkFuncType(nil, []*types.Type{i32, s1, emptys, a1}, []*types.Type{})
+
+	// Run abitest() just to document what we're expected to see.
+	exp := makeExpectedDump(`
+        IN 0: R{ I0 } spilloffset: 0 typ: int32
+        IN 1: R{ I1 I2 I3 I4 } spilloffset: 8 typ: struct { int8; int16; struct {}; int32; int64 }
+        IN 2: R{ } offset: 0 typ: struct {}
+        IN 3: R{ I5 } spilloffset: 24 typ: [1]int32
+        offsetToSpillArea: 0 spillAreaSize: 32
+`)
+	abitest(t, ft, exp)
+
+	// Analyze with full set of registers, then call ComputePadding
+	// on the second param, verifying the results.
+	regRes := configAMD64.ABIAnalyze(ft, false)
+	padding := make([]uint64, 32)
+	parm := regRes.InParams()[1]
+	padding = parm.ComputePadding(padding)
+	want := "[1 1 1 0]"
+	got := fmt.Sprintf("%+v", padding)
+	if got != want {
+		t.Errorf("padding mismatch: wanted %q got %q\n", got, want)
+	}
 }

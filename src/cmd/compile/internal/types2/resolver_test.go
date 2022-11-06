@@ -117,11 +117,7 @@ func TestResolveIdents(t *testing.T) {
 	// parse package files
 	var files []*syntax.File
 	for i, src := range sources {
-		f, err := parseSrc(fmt.Sprintf("sources[%d]", i), src)
-		if err != nil {
-			t.Fatal(err)
-		}
-		files = append(files, f)
+		files = append(files, mustParse(fmt.Sprintf("sources[%d]", i), src))
 	}
 
 	// resolve and type-check package AST
@@ -143,7 +139,7 @@ func TestResolveIdents(t *testing.T) {
 
 	// check that qualified identifiers are resolved
 	for _, f := range files {
-		syntax.Walk(f, func(n syntax.Node) bool {
+		syntax.Crawl(f, func(n syntax.Node) bool {
 			if s, ok := n.(*syntax.SelectorExpr); ok {
 				if x, ok := s.X.(*syntax.Name); ok {
 					obj := uses[x]
@@ -177,7 +173,7 @@ func TestResolveIdents(t *testing.T) {
 	foundDefs := make(map[*syntax.Name]bool)
 	var both []string
 	for _, f := range files {
-		syntax.Walk(f, func(n syntax.Node) bool {
+		syntax.Crawl(f, func(n syntax.Node) bool {
 			if x, ok := n.(*syntax.Name); ok {
 				var objects int
 				if _, found := uses[x]; found {

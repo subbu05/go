@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package get implements the ``go get'' command.
+// Package get implements the “go get” command.
 package get
 
 import (
@@ -114,19 +114,19 @@ func init() {
 func runGet(ctx context.Context, cmd *base.Command, args []string) {
 	if cfg.ModulesEnabled {
 		// Should not happen: main.go should install the separate module-enabled get code.
-		base.Fatalf("go get: modules not implemented")
+		base.Fatalf("go: modules not implemented")
 	}
 
 	work.BuildInit()
 
 	if *getF && !*getU {
-		base.Fatalf("go get: cannot use -f flag without -u")
+		base.Fatalf("go: cannot use -f flag without -u")
 	}
 	if *getInsecure {
-		base.Fatalf("go get: -insecure flag is no longer supported; use GOINSECURE instead")
+		base.Fatalf("go: -insecure flag is no longer supported; use GOINSECURE instead")
 	}
 
-	// Disable any prompting for passwords by Git.
+	// Disable any prompting for passwords by Git itself.
 	// Only has an effect for 2.3.0 or later, but avoiding
 	// the prompt in earlier versions is just too hard.
 	// If user has explicitly set GIT_TERMINAL_PROMPT=1, keep
@@ -136,7 +136,10 @@ func runGet(ctx context.Context, cmd *base.Command, args []string) {
 		os.Setenv("GIT_TERMINAL_PROMPT", "0")
 	}
 
-	// Disable any ssh connection pooling by Git.
+	// Also disable prompting for passwords by the 'ssh' subprocess spawned by
+	// Git, because apparently GIT_TERMINAL_PROMPT isn't sufficient to do that.
+	// Adding '-o BatchMode=yes' should do the trick.
+	//
 	// If a Git subprocess forks a child into the background to cache a new connection,
 	// that child keeps stdout/stderr open. After the Git subprocess exits,
 	// os /exec expects to be able to read from the stdout/stderr pipe
@@ -150,7 +153,14 @@ func runGet(ctx context.Context, cmd *base.Command, args []string) {
 	// assume they know what they are doing and don't step on it.
 	// But default to turning off ControlMaster.
 	if os.Getenv("GIT_SSH") == "" && os.Getenv("GIT_SSH_COMMAND") == "" {
-		os.Setenv("GIT_SSH_COMMAND", "ssh -o ControlMaster=no")
+		os.Setenv("GIT_SSH_COMMAND", "ssh -o ControlMaster=no -o BatchMode=yes")
+	}
+
+	// And one more source of Git prompts: the Git Credential Manager Core for Windows.
+	//
+	// See https://github.com/microsoft/Git-Credential-Manager-Core/blob/master/docs/environment.md#gcm_interactive.
+	if os.Getenv("GCM_INTERACTIVE") == "" {
+		os.Setenv("GCM_INTERACTIVE", "never")
 	}
 
 	// Phase 1. Download/update.
@@ -160,7 +170,7 @@ func runGet(ctx context.Context, cmd *base.Command, args []string) {
 		mode |= load.GetTestDeps
 	}
 	for _, pkg := range downloadPaths(args) {
-		download(pkg, nil, &stk, mode)
+		download(ctx, pkg, nil, &stk, mode)
 	}
 	base.ExitIfErrors()
 
@@ -173,7 +183,7 @@ func runGet(ctx context.Context, cmd *base.Command, args []string) {
 	// everything.
 	load.ClearPackageCache()
 
-	pkgs := load.PackagesAndErrors(ctx, args)
+	pkgs := load.PackagesAndErrors(ctx, load.PackageOpts{}, args)
 	load.CheckPackageErrors(pkgs)
 
 	// Phase 3. Install.
@@ -196,7 +206,6 @@ func downloadPaths(patterns []string) []string {
 	for _, arg := range patterns {
 		if strings.Contains(arg, "@") {
 			base.Fatalf("go: can only use path@version syntax with 'go get' and 'go install' in module-aware mode")
-			continue
 		}
 
 		// Guard against 'go get x.go', a common mistake.
@@ -204,18 +213,19 @@ func downloadPaths(patterns []string) []string {
 		// if the argument has no slash or refers to an existing file.
 		if strings.HasSuffix(arg, ".go") {
 			if !strings.Contains(arg, "/") {
-				base.Errorf("go get %s: arguments must be package or module paths", arg)
+				base.Errorf("go: %s: arguments must be package or module paths", arg)
 				continue
 			}
 			if fi, err := os.Stat(arg); err == nil && !fi.IsDir() {
-				base.Errorf("go get: %s exists as a file, but 'go get' requires package arguments", arg)
+				base.Errorf("go: %s exists as a file, but 'go get' requires package arguments", arg)
 			}
 		}
 	}
 	base.ExitIfErrors()
 
 	var pkgs []string
-	for _, m := range search.ImportPathsQuiet(patterns) {
+	noModRoots := []string{}
+	for _, m := range search.ImportPathsQuiet(patterns, noModRoots) {
 		if len(m.Pkgs) == 0 && strings.Contains(m.Pattern(), "...") {
 			pkgs = append(pkgs, m.Pattern())
 		} else {
@@ -240,7 +250,7 @@ var downloadRootCache = map[string]bool{}
 
 // download runs the download half of the get command
 // for the package or pattern named by the argument.
-func download(arg string, parent *load.Package, stk *load.ImportStack, mode int) {
+func download(ctx context.Context, arg string, parent *load.Package, stk *load.ImportStack, mode int) {
 	if mode&load.ResolveImport != 0 {
 		// Caller is responsible for expanding vendor paths.
 		panic("internal error: download mode has useVendor set")
@@ -248,9 +258,9 @@ func download(arg string, parent *load.Package, stk *load.ImportStack, mode int)
 	load1 := func(path string, mode int) *load.Package {
 		if parent == nil {
 			mode := 0 // don't do module or vendor resolution
-			return load.LoadImport(context.TODO(), path, base.Cwd, nil, stk, nil, mode)
+			return load.LoadImport(ctx, load.PackageOpts{}, path, base.Cwd(), nil, stk, nil, mode)
 		}
-		return load.LoadImport(context.TODO(), path, parent.Dir, parent, stk, nil, mode|load.ResolveModule)
+		return load.LoadImport(ctx, load.PackageOpts{}, path, parent.Dir, parent, stk, nil, mode|load.ResolveModule)
 	}
 
 	p := load1(arg, mode)
@@ -305,7 +315,8 @@ func download(arg string, parent *load.Package, stk *load.ImportStack, mode int)
 		if wildcardOkay && strings.Contains(arg, "...") {
 			match := search.NewMatch(arg)
 			if match.IsLocal() {
-				match.MatchDirs()
+				noModRoots := []string{} // We're in gopath mode, so there are no modroots.
+				match.MatchDirs(noModRoots)
 				args = match.Dirs
 			} else {
 				match.MatchPackages()
@@ -392,7 +403,7 @@ func download(arg string, parent *load.Package, stk *load.ImportStack, mode int)
 			if i >= len(p.Imports) {
 				path = load.ResolveImportPath(p, path)
 			}
-			download(path, p, stk, 0)
+			download(ctx, path, p, stk, 0)
 		}
 
 		if isWildcard {
@@ -405,10 +416,10 @@ func download(arg string, parent *load.Package, stk *load.ImportStack, mode int)
 // to make the first copy of or update a copy of the given package.
 func downloadPackage(p *load.Package) error {
 	var (
-		vcsCmd         *vcs.Cmd
-		repo, rootPath string
-		err            error
-		blindRepo      bool // set if the repo has unusual configuration
+		vcsCmd                  *vcs.Cmd
+		repo, rootPath, repoDir string
+		err                     error
+		blindRepo               bool // set if the repo has unusual configuration
 	)
 
 	// p can be either a real package, or a pseudo-package whose “import path” is
@@ -434,10 +445,19 @@ func downloadPackage(p *load.Package) error {
 
 	if p.Internal.Build.SrcRoot != "" {
 		// Directory exists. Look for checkout along path to src.
-		vcsCmd, rootPath, err = vcs.FromDir(p.Dir, p.Internal.Build.SrcRoot)
+		const allowNesting = false
+		repoDir, vcsCmd, err = vcs.FromDir(p.Dir, p.Internal.Build.SrcRoot, allowNesting)
 		if err != nil {
 			return err
 		}
+		if !str.HasFilePathPrefix(repoDir, p.Internal.Build.SrcRoot) {
+			panic(fmt.Sprintf("repository %q not in source root %q", repo, p.Internal.Build.SrcRoot))
+		}
+		rootPath = str.TrimFilePathPrefix(repoDir, p.Internal.Build.SrcRoot)
+		if err := vcs.CheckGOVCS(vcsCmd, rootPath); err != nil {
+			return err
+		}
+
 		repo = "<local>" // should be unused; make distinctive
 
 		// Double-check where it came from.
@@ -475,21 +495,21 @@ func downloadPackage(p *load.Package) error {
 		vcsCmd, repo, rootPath = rr.VCS, rr.Repo, rr.Root
 	}
 	if !blindRepo && !vcsCmd.IsSecure(repo) && security != web.Insecure {
-		return fmt.Errorf("cannot download, %v uses insecure protocol", repo)
+		return fmt.Errorf("cannot download: %v uses insecure protocol", repo)
 	}
 
 	if p.Internal.Build.SrcRoot == "" {
 		// Package not found. Put in first directory of $GOPATH.
 		list := filepath.SplitList(cfg.BuildContext.GOPATH)
 		if len(list) == 0 {
-			return fmt.Errorf("cannot download, $GOPATH not set. For more details see: 'go help gopath'")
+			return fmt.Errorf("cannot download: $GOPATH not set. For more details see: 'go help gopath'")
 		}
 		// Guard against people setting GOPATH=$GOROOT.
 		if filepath.Clean(list[0]) == filepath.Clean(cfg.GOROOT) {
-			return fmt.Errorf("cannot download, $GOPATH must not be set to $GOROOT. For more details see: 'go help gopath'")
+			return fmt.Errorf("cannot download: $GOPATH must not be set to $GOROOT. For more details see: 'go help gopath'")
 		}
 		if _, err := os.Stat(filepath.Join(list[0], "src/cmd/go/alldocs.go")); err == nil {
-			return fmt.Errorf("cannot download, %s is a GOROOT, not a GOPATH. For more details see: 'go help gopath'", list[0])
+			return fmt.Errorf("cannot download: %s is a GOROOT, not a GOPATH. For more details see: 'go help gopath'", list[0])
 		}
 		p.Internal.Build.Root = list[0]
 		p.Internal.Build.SrcRoot = filepath.Join(list[0], "src")

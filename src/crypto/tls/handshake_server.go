@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"sync/atomic"
 	"time"
 )
 
@@ -122,7 +121,7 @@ func (hs *serverHandshakeState) handshake() error {
 	}
 
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random)
-	atomic.StoreUint32(&c.handshakeStatus, 1)
+	c.isHandshakeComplete.Store(true)
 
 	return nil
 }
@@ -156,7 +155,7 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
 	if len(clientHello.supportedVersions) == 0 {
 		clientVersions = supportedVersionsFromMax(clientHello.vers)
 	}
-	c.vers, ok = c.config.mutualVersion(clientVersions)
+	c.vers, ok = c.config.mutualVersion(roleServer, clientVersions)
 	if !ok {
 		c.sendAlert(alertProtocolVersion)
 		return nil, fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
@@ -191,7 +190,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 	hs.hello.random = make([]byte, 32)
 	serverRandom := hs.hello.random
 	// Downgrade protection canaries. See RFC 8446, Section 4.1.3.
-	maxVers := c.config.maxSupportedVersion()
+	maxVers := c.config.maxSupportedVersion(roleServer)
 	if maxVers >= VersionTLS12 && c.vers < maxVers || testingOnlyForceDowngradeCanary {
 		if c.vers == VersionTLS12 {
 			copy(serverRandom[24:], downgradeCanaryTLS12)
@@ -217,12 +216,13 @@ func (hs *serverHandshakeState) processClientHello() error {
 		c.serverName = hs.clientHello.serverName
 	}
 
-	if len(hs.clientHello.alpnProtocols) > 0 {
-		if selectedProto := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos); selectedProto != "" {
-			hs.hello.alpnProtocol = selectedProto
-			c.clientProtocol = selectedProto
-		}
+	selectedProto, err := negotiateALPN(c.config.NextProtos, hs.clientHello.alpnProtocols)
+	if err != nil {
+		c.sendAlert(alertNoApplicationProtocol)
+		return err
 	}
+	hs.hello.alpnProtocol = selectedProto
+	c.clientProtocol = selectedProto
 
 	hs.cert, err = c.config.getCertificate(clientHelloInfo(hs.ctx, c, hs.clientHello))
 	if err != nil {
@@ -239,7 +239,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 
 	hs.ecdheOk = supportsECDHE(c.config, hs.clientHello.supportedCurves, hs.clientHello.supportedPoints)
 
-	if hs.ecdheOk {
+	if hs.ecdheOk && len(hs.clientHello.supportedPoints) > 0 {
 		// Although omitting the ec_point_formats extension is permitted, some
 		// old OpenSSL version will refuse to handshake if not present.
 		//
@@ -274,6 +274,34 @@ func (hs *serverHandshakeState) processClientHello() error {
 	return nil
 }
 
+// negotiateALPN picks a shared ALPN protocol that both sides support in server
+// preference order. If ALPN is not configured or the peer doesn't support it,
+// it returns "" and no error.
+func negotiateALPN(serverProtos, clientProtos []string) (string, error) {
+	if len(serverProtos) == 0 || len(clientProtos) == 0 {
+		return "", nil
+	}
+	var http11fallback bool
+	for _, s := range serverProtos {
+		for _, c := range clientProtos {
+			if s == c {
+				return s, nil
+			}
+			if s == "h2" && c == "http/1.1" {
+				http11fallback = true
+			}
+		}
+	}
+	// As a special case, let http/1.1 clients connect to h2 servers as if they
+	// didn't support ALPN. We used not to enforce protocol overlap, so over
+	// time a number of HTTP servers were configured with only "h2", but
+	// expected to accept connections from "http/1.1" clients. See Issue 46310.
+	if http11fallback {
+		return "", nil
+	}
+	return "", fmt.Errorf("tls: client requested unsupported application protocols (%s)", clientProtos)
+}
+
 // supportsECDHE returns whether ECDHE key exchanges can be used with this
 // pre-TLS 1.3 client.
 func supportsECDHE(c *Config, supportedCurves []CurveID, supportedPoints []uint8) bool {
@@ -292,6 +320,13 @@ func supportsECDHE(c *Config, supportedCurves []CurveID, supportedPoints []uint8
 			break
 		}
 	}
+	// Per RFC 8422, Section 5.1.2, if the Supported Point Formats extension is
+	// missing, uncompressed points are supported. If supportedPoints is empty,
+	// the extension must be missing, as an empty extension body is rejected by
+	// the parser. See https://go.dev/issue/49126.
+	if len(supportedPoints) == 0 {
+		supportsPointFormat = true
+	}
 
 	return supportsCurve && supportsPointFormat
 }
@@ -299,30 +334,23 @@ func supportsECDHE(c *Config, supportedCurves []CurveID, supportedPoints []uint8
 func (hs *serverHandshakeState) pickCipherSuite() error {
 	c := hs.c
 
-	var preferenceList, supportedList []uint16
-	if c.config.PreferServerCipherSuites {
-		preferenceList = c.config.cipherSuites()
-		supportedList = hs.clientHello.cipherSuites
+	preferenceOrder := cipherSuitesPreferenceOrder
+	if !hasAESGCMHardwareSupport || !aesgcmPreferred(hs.clientHello.cipherSuites) {
+		preferenceOrder = cipherSuitesPreferenceOrderNoAES
+	}
 
-		// If the client does not seem to have hardware support for AES-GCM,
-		// and the application did not specify a cipher suite preference order,
-		// prefer other AEAD ciphers even if we prioritized AES-GCM ciphers
-		// by default.
-		if c.config.CipherSuites == nil && !aesgcmPreferred(hs.clientHello.cipherSuites) {
-			preferenceList = deprioritizeAES(preferenceList)
-		}
-	} else {
-		preferenceList = hs.clientHello.cipherSuites
-		supportedList = c.config.cipherSuites()
-
-		// If we don't have hardware support for AES-GCM, prefer other AEAD
-		// ciphers even if the client prioritized AES-GCM.
-		if !hasAESGCMHardwareSupport {
-			preferenceList = deprioritizeAES(preferenceList)
+	configCipherSuites := c.config.cipherSuites()
+	preferenceList := make([]uint16, 0, len(configCipherSuites))
+	for _, suiteID := range preferenceOrder {
+		for _, id := range configCipherSuites {
+			if id == suiteID {
+				preferenceList = append(preferenceList, id)
+				break
+			}
 		}
 	}
 
-	hs.suite = selectCipherSuite(preferenceList, supportedList, hs.cipherSuiteOk)
+	hs.suite = selectCipherSuite(preferenceList, hs.clientHello.cipherSuites, hs.cipherSuiteOk)
 	if hs.suite == nil {
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("tls: no cipher suite supported by both client and server")
@@ -332,7 +360,7 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 	for _, id := range hs.clientHello.cipherSuites {
 		if id == TLS_FALLBACK_SCSV {
 			// The client is doing a fallback connection. See RFC 7507.
-			if hs.clientHello.vers < c.config.maxSupportedVersion() {
+			if hs.clientHello.vers < c.config.maxSupportedVersion(roleServer) {
 				c.sendAlert(alertInappropriateFallback)
 				return errors.New("tls: client using inappropriate protocol fallback")
 			}
@@ -519,7 +547,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		}
 		if c.vers >= VersionTLS12 {
 			certReq.hasSignatureAlgorithm = true
-			certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms
+			certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms()
 		}
 
 		// An empty list of certificateAuthorities signals to
@@ -639,7 +667,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 			}
 		}
 
-		signed := hs.finishedHash.hashForClientCertificate(sigType, sigHash, hs.masterSecret)
+		signed := hs.finishedHash.hashForClientCertificate(sigType, sigHash)
 		if err := verifyHandshakeSignature(sigType, pub, sigHash, signed, certVerify.signature); err != nil {
 			c.sendAlert(alertDecryptError)
 			return errors.New("tls: invalid signature by the client certificate: " + err.Error())
@@ -659,7 +687,7 @@ func (hs *serverHandshakeState) establishKeys() error {
 	clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV :=
 		keysFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random, hs.suite.macLen, hs.suite.keyLen, hs.suite.ivLen)
 
-	var clientCipher, serverCipher interface{}
+	var clientCipher, serverCipher any
 	var clientHash, serverHash hash.Hash
 
 	if hs.suite.aead == nil {

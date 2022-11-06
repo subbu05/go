@@ -33,7 +33,6 @@ import (
 //	if err := fstest.TestFS(myFS, "file/that/should/be/present"); err != nil {
 //		t.Fatal(err)
 //	}
-//
 func TestFS(fsys fs.FS, expected ...string) error {
 	if err := testFS(fsys, expected...); err != nil {
 		return err
@@ -105,7 +104,7 @@ type fsTester struct {
 }
 
 // errorf adds an error line to errText.
-func (t *fsTester) errorf(format string, args ...interface{}) {
+func (t *fsTester) errorf(format string, args ...any) {
 	if len(t.errText) > 0 {
 		t.errText = append(t.errText, '\n')
 	}
@@ -536,6 +535,18 @@ func (t *fsTester) checkFile(file string) {
 			return
 		}
 		t.checkFileRead(file, "ReadAll vs fsys.ReadFile", data, data2)
+
+		// Modify the data and check it again. Modifying the
+		// returned byte slice should not affect the next call.
+		for i := range data2 {
+			data2[i]++
+		}
+		data2, err = fsys.ReadFile(file)
+		if err != nil {
+			t.errorf("%s: second call to fsys.ReadFile: %v", file, err)
+			return
+		}
+		t.checkFileRead(file, "Readall vs second fsys.ReadFile", data, data2)
 
 		t.checkBadPath(file, "ReadFile",
 			func(name string) error { _, err := fsys.ReadFile(name); return err })

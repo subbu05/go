@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux && cgo
 // +build linux,cgo
 
 package cgotest
@@ -9,6 +10,8 @@ package cgotest
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -105,11 +108,23 @@ func compareStatus(filter, expect string) error {
 				// "Pid:\t".
 			}
 			if strings.HasPrefix(line, filter) {
-				if line != expected {
-					return fmt.Errorf("%q got:%q want:%q (bad) [pid=%d file:'%s' %v]\n", tf, line, expected, pid, string(d), expectedProc)
+				if line == expected {
+					foundAThread = true
+					break
 				}
-				foundAThread = true
-				break
+				if filter == "Groups:" && strings.HasPrefix(line, "Groups:\t") {
+					// https://github.com/golang/go/issues/46145
+					// Containers don't reliably output this line in sorted order so manually sort and compare that.
+					a := strings.Split(line[8:], " ")
+					sort.Strings(a)
+					got := strings.Join(a, " ")
+					if got == expected[8:] {
+						foundAThread = true
+						break
+					}
+
+				}
+				return fmt.Errorf("%q got:%q want:%q (bad) [pid=%d file:'%s' %v]\n", tf, line, expected, pid, string(d), expectedProc)
 			}
 		}
 	}
@@ -130,6 +145,11 @@ func compareStatus(filter, expect string) error {
 func test1435(t *testing.T) {
 	if syscall.Getuid() != 0 {
 		t.Skip("skipping root only test")
+	}
+	if runtime.GOOS == "linux" {
+		if _, err := os.Stat("/etc/alpine-release"); err == nil {
+			t.Skip("skipping failing test on alpine - go.dev/issue/19938")
+		}
 	}
 
 	// Launch some threads in C.

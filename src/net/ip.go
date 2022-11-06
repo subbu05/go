@@ -308,7 +308,7 @@ func ubtoa(dst []byte, start int, v byte) int {
 // It returns one of 4 forms:
 //   - "<nil>", if ip has length 0
 //   - dotted decimal ("192.0.2.1"), if ip is an IPv4 or IP4-mapped IPv6 address
-//   - IPv6 ("2001:db8::1"), if ip is a valid IPv6 address
+//   - IPv6 conforming to RFC 5952 ("2001:db8::1"), if ip is a valid IPv6 address
 //   - the hexadecimal form of ip, without punctuation, if no other cases apply
 func (ip IP) String() string {
 	p := ip
@@ -545,6 +545,9 @@ func (n *IPNet) Network() string { return "ip+net" }
 // character and a mask expressed as hexadecimal form with no
 // punctuation like "198.51.100.0/c000ff00".
 func (n *IPNet) String() string {
+	if n == nil {
+		return "<nil>"
+	}
 	nn, m := networkNumberAndMask(n)
 	if nn == nil || m == nil {
 		return "<nil>"
@@ -572,6 +575,10 @@ func parseIPv4(s string) IP {
 		}
 		n, c, ok := dtoi(s)
 		if !ok || n > 0xFF {
+			return nil
+		}
+		if c > 1 && s[0] == '0' {
+			// Reject non-zero components with leading zeroes.
 			return nil
 		}
 		s = s[c:]
@@ -749,4 +756,10 @@ func ParseCIDR(s string) (IP, *IPNet, error) {
 	}
 	m := CIDRMask(n, 8*iplen)
 	return ip, &IPNet{IP: ip.Mask(m), Mask: m}, nil
+}
+
+func copyIP(x IP) IP {
+	y := make(IP, len(x))
+	copy(y, x)
+	return y
 }

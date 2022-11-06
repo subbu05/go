@@ -5,8 +5,9 @@
 package runtime
 
 import (
+	"internal/abi"
+	"internal/goarch"
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -322,7 +323,7 @@ func monitorSuspendResume() {
 	if powerRegisterSuspendResumeNotification == nil {
 		return // Running on Windows 7, where we don't need it anyway.
 	}
-	var fn interface{} = func(context uintptr, changeType uint32, setting uintptr) uintptr {
+	var fn any = func(context uintptr, changeType uint32, setting uintptr) uintptr {
 		for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
 			if mp.resumesema != 0 {
 				stdcall1(_SetEvent, mp.resumesema)
@@ -543,7 +544,7 @@ func initLongPathSupport() {
 }
 
 func osinit() {
-	asmstdcallAddr = unsafe.Pointer(funcPC(asmstdcall))
+	asmstdcallAddr = unsafe.Pointer(abi.FuncPCABI0(asmstdcall))
 
 	setBadSignalMsg()
 
@@ -681,7 +682,7 @@ func goenvs() {
 
 	// We call these all the way here, late in init, so that malloc works
 	// for the callback functions these generate.
-	var fn interface{} = ctrlHandler
+	var fn any = ctrlHandler
 	ctrlHandlerPC := compileCallback(*efaceOf(&fn), true)
 	stdcall2(_SetConsoleCtrlHandler, ctrlHandlerPC, 1)
 
@@ -804,9 +805,6 @@ func writeConsoleUTF16(handle uintptr, b []uint16) {
 	return
 }
 
-// walltime1 isn't implemented on Windows, but will never be called.
-func walltime1() (sec int64, nsec int32)
-
 //go:nosplit
 func semasleep(ns int64) int32 {
 	const (
@@ -904,12 +902,13 @@ func semacreate(mp *m) {
 // May run with m.p==nil, so write barriers are not allowed. This
 // function is called by newosproc0, so it is also required to
 // operate without stack guards.
+//
 //go:nowritebarrierrec
 //go:nosplit
 func newosproc(mp *m) {
 	// We pass 0 for the stack size to use the default for this binary.
 	thandle := stdcall6(_CreateThread, 0, 0,
-		funcPC(tstart_stdcall), uintptr(unsafe.Pointer(mp)),
+		abi.FuncPCABI0(tstart_stdcall), uintptr(unsafe.Pointer(mp)),
 		0, 0)
 
 	if thandle == 0 {
@@ -932,6 +931,7 @@ func newosproc(mp *m) {
 // Used by the C library build mode. On Linux this function would allocate a
 // stack, but that's not necessary for Windows. No stack guards are present
 // and the GC has not been initialized, so write barriers will fail.
+//
 //go:nowritebarrierrec
 //go:nosplit
 func newosproc0(mp *m, stk unsafe.Pointer) {
@@ -941,7 +941,7 @@ func newosproc0(mp *m, stk unsafe.Pointer) {
 	throw("bad newosproc0")
 }
 
-func exitThread(wait *uint32) {
+func exitThread(wait *atomic.Uint32) {
 	// We should never reach exitThread on Windows because we let
 	// the OS clean up threads.
 	throw("exitThread")
@@ -1021,6 +1021,7 @@ func minit() {
 }
 
 // Called from dropm to undo the effect of an minit.
+//
 //go:nosplit
 func unminit() {
 	mp := getg().m
@@ -1034,6 +1035,7 @@ func unminit() {
 
 // Called from exitm, but not from drop, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+//
 //go:nosplit
 func mdestroy(mp *m) {
 	if mp.highResTimer != 0 {
@@ -1052,6 +1054,7 @@ func mdestroy(mp *m) {
 
 // Calling stdcall on os stack.
 // May run during STW, so write barriers are not allowed.
+//
 //go:nowritebarrier
 //go:nosplit
 func stdcall(fn stdFunction) uintptr {
@@ -1084,6 +1087,7 @@ func stdcall0(fn stdFunction) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall1(fn stdFunction, a0 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 1
@@ -1092,6 +1096,7 @@ func stdcall1(fn stdFunction, a0 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall2(fn stdFunction, a0, a1 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 2
@@ -1100,6 +1105,7 @@ func stdcall2(fn stdFunction, a0, a1 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall3(fn stdFunction, a0, a1, a2 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 3
@@ -1108,6 +1114,7 @@ func stdcall3(fn stdFunction, a0, a1, a2 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall4(fn stdFunction, a0, a1, a2, a3 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 4
@@ -1116,6 +1123,7 @@ func stdcall4(fn stdFunction, a0, a1, a2, a3 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall5(fn stdFunction, a0, a1, a2, a3, a4 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 5
@@ -1124,6 +1132,7 @@ func stdcall5(fn stdFunction, a0, a1, a2, a3, a4 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall6(fn stdFunction, a0, a1, a2, a3, a4, a5 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 6
@@ -1132,6 +1141,7 @@ func stdcall6(fn stdFunction, a0, a1, a2, a3, a4, a5 uintptr) uintptr {
 }
 
 //go:nosplit
+//go:cgo_unsafe_args
 func stdcall7(fn stdFunction, a0, a1, a2, a3, a4, a5, a6 uintptr) uintptr {
 	mp := getg().m
 	mp.libcall.n = 7
@@ -1189,8 +1199,10 @@ func ctrlHandler(_type uint32) uintptr {
 	if sigsend(s) {
 		if s == _SIGTERM {
 			// Windows terminates the process after this handler returns.
-			// Block indefinitely to give signal handlers a chance to clean up.
-			stdcall1(_Sleep, uintptr(_INFINITE))
+			// Block indefinitely to give signal handlers a chance to clean up,
+			// but make sure to be properly parked first, so the rest of the
+			// program can continue executing.
+			block()
 		}
 		return 1
 	}
@@ -1299,18 +1311,13 @@ func setThreadCPUProfiler(hz int32) {
 	atomic.Store((*uint32)(unsafe.Pointer(&getg().m.profilehz)), uint32(hz))
 }
 
-const preemptMSupported = GOARCH == "386" || GOARCH == "amd64"
+const preemptMSupported = true
 
 // suspendLock protects simultaneous SuspendThread operations from
 // suspending each other.
 var suspendLock mutex
 
 func preemptM(mp *m) {
-	if !preemptMSupported {
-		// TODO: Implement call injection
-		return
-	}
-
 	if mp == getg().m {
 		throw("self-preempt")
 	}
@@ -1319,7 +1326,7 @@ func preemptM(mp *m) {
 	if !atomic.Cas(&mp.preemptExtLock, 0, 1) {
 		// External code is running. Fail the preemption
 		// attempt.
-		atomic.Xadd(&mp.preemptGen, 1)
+		mp.preemptGen.Add(1)
 		return
 	}
 
@@ -1329,7 +1336,7 @@ func preemptM(mp *m) {
 		// The M hasn't been minit'd yet (or was just unminit'd).
 		unlock(&mp.threadLock)
 		atomic.Store(&mp.preemptExtLock, 0)
-		atomic.Xadd(&mp.preemptGen, 1)
+		mp.preemptGen.Add(1)
 		return
 	}
 	var thread uintptr
@@ -1359,7 +1366,7 @@ func preemptM(mp *m) {
 		atomic.Store(&mp.preemptExtLock, 0)
 		// The thread no longer exists. This shouldn't be
 		// possible, but just acknowledge the request.
-		atomic.Xadd(&mp.preemptGen, 1)
+		mp.preemptGen.Add(1)
 		return
 	}
 
@@ -1381,19 +1388,42 @@ func preemptM(mp *m) {
 	if gp != nil && wantAsyncPreempt(gp) {
 		if ok, newpc := isAsyncSafePoint(gp, c.ip(), c.sp(), c.lr()); ok {
 			// Inject call to asyncPreempt
-			targetPC := funcPC(asyncPreempt)
+			targetPC := abi.FuncPCABI0(asyncPreempt)
 			switch GOARCH {
 			default:
 				throw("unsupported architecture")
 			case "386", "amd64":
 				// Make it look like the thread called targetPC.
 				sp := c.sp()
-				sp -= sys.PtrSize
+				sp -= goarch.PtrSize
 				*(*uintptr)(unsafe.Pointer(sp)) = newpc
 				c.set_sp(sp)
 				c.set_ip(targetPC)
-			}
 
+			case "arm":
+				// Push LR. The injected call is responsible
+				// for restoring LR. gentraceback is aware of
+				// this extra slot. See sigctxt.pushCall in
+				// signal_arm.go, which is similar except we
+				// subtract 1 from IP here.
+				sp := c.sp()
+				sp -= goarch.PtrSize
+				c.set_sp(sp)
+				*(*uint32)(unsafe.Pointer(sp)) = uint32(c.lr())
+				c.set_lr(newpc - 1)
+				c.set_ip(targetPC)
+
+			case "arm64":
+				// Push LR. The injected call is responsible
+				// for restoring LR. gentraceback is aware of
+				// this extra slot. See sigctxt.pushCall in
+				// signal_arm64.go.
+				sp := c.sp() - 16 // SP needs 16-byte alignment
+				c.set_sp(sp)
+				*(*uint64)(unsafe.Pointer(sp)) = uint64(c.lr())
+				c.set_lr(newpc)
+				c.set_ip(targetPC)
+			}
 			stdcall2(_SetThreadContext, thread, uintptr(unsafe.Pointer(c)))
 		}
 	}
@@ -1401,7 +1431,7 @@ func preemptM(mp *m) {
 	atomic.Store(&mp.preemptExtLock, 0)
 
 	// Acknowledge the preemption.
-	atomic.Xadd(&mp.preemptGen, 1)
+	mp.preemptGen.Add(1)
 
 	stdcall1(_ResumeThread, thread)
 	stdcall1(_CloseHandle, thread)

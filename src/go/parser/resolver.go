@@ -7,8 +7,8 @@ package parser
 import (
 	"fmt"
 	"go/ast"
-	"go/internal/typeparams"
 	"go/token"
+	"strings"
 )
 
 const debugResolve = false
@@ -19,12 +19,13 @@ const debugResolve = false
 // If declErr is non-nil, it is used to report declaration errors during
 // resolution. tok is used to format position in error messages.
 func resolveFile(file *ast.File, handle *token.File, declErr func(token.Pos, string)) {
-	topScope := ast.NewScope(nil)
+	pkgScope := ast.NewScope(nil)
 	r := &resolver{
 		handle:   handle,
 		declErr:  declErr,
-		topScope: topScope,
-		pkgScope: topScope,
+		topScope: pkgScope,
+		pkgScope: pkgScope,
+		depth:    1,
 	}
 
 	for _, decl := range file.Decls {
@@ -46,12 +47,14 @@ func resolveFile(file *ast.File, handle *token.File, declErr func(token.Pos, str
 			i++
 		} else if debugResolve {
 			pos := ident.Obj.Decl.(interface{ Pos() token.Pos }).Pos()
-			r.dump("resolved %s@%v to package object %v", ident.Name, ident.Pos(), pos)
+			r.trace("resolved %s@%v to package object %v", ident.Name, ident.Pos(), pos)
 		}
 	}
 	file.Scope = r.pkgScope
 	file.Unresolved = r.unresolved[0:i]
 }
+
+const maxScopeDepth int = 1e3
 
 type resolver struct {
 	handle  *token.File
@@ -61,6 +64,7 @@ type resolver struct {
 	pkgScope   *ast.Scope   // pkgScope.Outer == nil
 	topScope   *ast.Scope   // top-most scope; may be pkgScope
 	unresolved []*ast.Ident // unresolved identifiers
+	depth      int          // scope depth
 
 	// Label scopes
 	// (maintained by open/close LabelScope)
@@ -68,11 +72,11 @@ type resolver struct {
 	targetStack [][]*ast.Ident // stack of unresolved labels
 }
 
-func (r *resolver) dump(format string, args ...interface{}) {
-	fmt.Println(">>> " + r.sprintf(format, args...))
+func (r *resolver) trace(format string, args ...any) {
+	fmt.Println(strings.Repeat(". ", r.depth) + r.sprintf(format, args...))
 }
 
-func (r *resolver) sprintf(format string, args ...interface{}) string {
+func (r *resolver) sprintf(format string, args ...any) string {
 	for i, arg := range args {
 		switch arg := arg.(type) {
 		case token.Pos:
@@ -83,15 +87,20 @@ func (r *resolver) sprintf(format string, args ...interface{}) string {
 }
 
 func (r *resolver) openScope(pos token.Pos) {
+	r.depth++
+	if r.depth > maxScopeDepth {
+		panic(bailout{pos: pos, msg: "exceeded max scope depth during object resolution"})
+	}
 	if debugResolve {
-		r.dump("opening scope @%v", pos)
+		r.trace("opening scope @%v", pos)
 	}
 	r.topScope = ast.NewScope(r.topScope)
 }
 
 func (r *resolver) closeScope() {
+	r.depth--
 	if debugResolve {
-		r.dump("closing scope")
+		r.trace("closing scope")
 	}
 	r.topScope = r.topScope.Outer
 }
@@ -116,29 +125,29 @@ func (r *resolver) closeLabelScope() {
 	r.labelScope = r.labelScope.Outer
 }
 
-func (r *resolver) declare(decl, data interface{}, scope *ast.Scope, kind ast.ObjKind, idents ...*ast.Ident) {
+func (r *resolver) declare(decl, data any, scope *ast.Scope, kind ast.ObjKind, idents ...*ast.Ident) {
 	for _, ident := range idents {
-		// "type" is used for type lists in interfaces, and is otherwise an invalid
-		// identifier. The 'type' identifier is also artificially duplicated in the
-		// type list, so could cause panics below if we were to proceed.
-		if ident.Name == "type" {
-			continue
+		if ident.Obj != nil {
+			panic(fmt.Sprintf("%v: identifier %s already declared or resolved", ident.Pos(), ident.Name))
 		}
-		assert(ident.Obj == nil, "identifier already declared or resolved")
 		obj := ast.NewObj(kind, ident.Name)
 		// remember the corresponding declaration for redeclaration
 		// errors and global variable resolution/typechecking phase
 		obj.Decl = decl
 		obj.Data = data
-		ident.Obj = obj
+		// Identifiers (for receiver type parameters) are written to the scope, but
+		// never set as the resolved object. See issue #50956.
+		if _, ok := decl.(*ast.Ident); !ok {
+			ident.Obj = obj
+		}
 		if ident.Name != "_" {
 			if debugResolve {
-				r.dump("declaring %s@%v", ident.Name, ident.Pos())
+				r.trace("declaring %s@%v", ident.Name, ident.Pos())
 			}
 			if alt := scope.Insert(obj); alt != nil && r.declErr != nil {
 				prevDecl := ""
 				if pos := alt.Pos(); pos.IsValid() {
-					prevDecl = fmt.Sprintf("\n\tprevious declaration at %s", r.handle.Position(pos))
+					prevDecl = r.sprintf("\n\tprevious declaration at %v", pos)
 				}
 				r.declErr(ident.Pos(), fmt.Sprintf("%s redeclared in this block%s", ident.Name, prevDecl))
 			}
@@ -160,7 +169,7 @@ func (r *resolver) shortVarDecl(decl *ast.AssignStmt) {
 			ident.Obj = obj
 			if ident.Name != "_" {
 				if debugResolve {
-					r.dump("declaring %s@%v", ident.Name, ident.Pos())
+					r.trace("declaring %s@%v", ident.Name, ident.Pos())
 				}
 				if alt := r.topScope.Insert(obj); alt != nil {
 					ident.Obj = alt // redeclaration
@@ -184,21 +193,26 @@ var unresolved = new(ast.Object)
 // the object it denotes. If no object is found and collectUnresolved is
 // set, x is marked as unresolved and collected in the list of unresolved
 // identifiers.
-//
 func (r *resolver) resolve(ident *ast.Ident, collectUnresolved bool) {
 	if ident.Obj != nil {
-		panic(fmt.Sprintf("%s: identifier %s already declared or resolved", r.handle.Position(ident.Pos()), ident.Name))
+		panic(r.sprintf("%v: identifier %s already declared or resolved", ident.Pos(), ident.Name))
 	}
-	// '_' and 'type' should never refer to existing declarations: '_' because it
-	// has special handling in the spec, and 'type' because it is a keyword, and
-	// only valid in an interface type list.
-	if ident.Name == "_" || ident.Name == "type" {
+	// '_' should never refer to existing declarations, because it has special
+	// handling in the spec.
+	if ident.Name == "_" {
 		return
 	}
 	for s := r.topScope; s != nil; s = s.Outer {
 		if obj := s.Lookup(ident.Name); obj != nil {
+			if debugResolve {
+				r.trace("resolved %v:%s to %v", ident.Pos(), ident.Name, obj)
+			}
 			assert(obj.Name != "", "obj with no name")
-			ident.Obj = obj
+			// Identifiers (for receiver type parameters) are written to the scope,
+			// but never set as the resolved object. See issue #50956.
+			if _, ok := obj.Decl.(*ast.Ident); !ok {
+				ident.Obj = obj
+			}
 			return
 		}
 	}
@@ -235,7 +249,7 @@ func (r *resolver) walkStmts(list []ast.Stmt) {
 
 func (r *resolver) Visit(node ast.Node) ast.Visitor {
 	if debugResolve && node != nil {
-		r.dump("node %T@%v", node, node.Pos())
+		r.trace("node %T@%v", node, node.Pos())
 	}
 
 	switch n := node.(type) {
@@ -245,9 +259,10 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 		r.resolve(n, true)
 
 	case *ast.FuncLit:
-		functionScope := ast.NewScope(r.topScope)
-		r.walkFuncType(functionScope, n.Type)
-		r.walkBody(functionScope, n.Body)
+		r.openScope(n.Pos())
+		defer r.closeScope()
+		r.walkFuncType(n.Type)
+		r.walkBody(n.Body)
 
 	case *ast.SelectorExpr:
 		ast.Walk(r, n.X)
@@ -255,12 +270,14 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 		// resolution.
 
 	case *ast.StructType:
-		scope := ast.NewScope(nil)
-		r.walkFieldList(scope, n.Fields, ast.Var)
+		r.openScope(n.Pos())
+		defer r.closeScope()
+		r.walkFieldList(n.Fields, ast.Var)
 
 	case *ast.FuncType:
-		scope := ast.NewScope(r.topScope)
-		r.walkFuncType(scope, n)
+		r.openScope(n.Pos())
+		defer r.closeScope()
+		r.walkFuncType(n)
 
 	case *ast.CompositeLit:
 		if n.Type != nil {
@@ -283,8 +300,9 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 		}
 
 	case *ast.InterfaceType:
-		scope := ast.NewScope(nil)
-		r.walkFieldList(scope, n.Methods, ast.Fun)
+		r.openScope(n.Pos())
+		defer r.closeScope()
+		r.walkFieldList(n.Methods, ast.Fun)
 
 	// Statements
 	case *ast.LabeledStmt:
@@ -451,20 +469,38 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 				// at the identifier in the TypeSpec and ends at the end of the innermost
 				// containing block.
 				r.declare(spec, nil, r.topScope, ast.Typ, spec.Name)
-				if tparams := typeparams.Get(spec); tparams != nil {
+				if spec.TypeParams != nil {
 					r.openScope(spec.Pos())
 					defer r.closeScope()
-					r.walkFieldList(r.topScope, tparams, ast.Typ)
+					r.walkTParams(spec.TypeParams)
 				}
 				ast.Walk(r, spec.Type)
 			}
 		}
 
 	case *ast.FuncDecl:
-		scope := ast.NewScope(r.topScope)
-		r.walkFieldList(scope, n.Recv, ast.Var)
-		r.walkFuncType(scope, n.Type)
-		r.walkBody(scope, n.Body)
+		// Open the function scope.
+		r.openScope(n.Pos())
+		defer r.closeScope()
+
+		r.walkRecv(n.Recv)
+
+		// Type parameters are walked normally: they can reference each other, and
+		// can be referenced by normal parameters.
+		if n.Type.TypeParams != nil {
+			r.walkTParams(n.Type.TypeParams)
+			// TODO(rFindley): need to address receiver type parameters.
+		}
+
+		// Resolve and declare parameters in a specific order to get duplicate
+		// declaration errors in the correct location.
+		r.resolveList(n.Type.Params)
+		r.resolveList(n.Type.Results)
+		r.declareList(n.Recv, ast.Var)
+		r.declareList(n.Type.Params, ast.Var)
+		r.declareList(n.Type.Results, ast.Var)
+
+		r.walkBody(n.Body)
 		if n.Recv == nil && n.Name.Name != "init" {
 			r.declare(n, nil, r.pkgScope, ast.Fun, n.Name)
 		}
@@ -476,12 +512,15 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 	return nil
 }
 
-func (r *resolver) walkFuncType(scope *ast.Scope, typ *ast.FuncType) {
-	r.walkFieldList(scope, typ.Params, ast.Var)
-	r.walkFieldList(scope, typ.Results, ast.Var)
+func (r *resolver) walkFuncType(typ *ast.FuncType) {
+	// typ.TypeParams must be walked separately for FuncDecls.
+	r.resolveList(typ.Params)
+	r.resolveList(typ.Results)
+	r.declareList(typ.Params, ast.Var)
+	r.declareList(typ.Results, ast.Var)
 }
 
-func (r *resolver) walkFieldList(scope *ast.Scope, list *ast.FieldList, kind ast.ObjKind) {
+func (r *resolver) resolveList(list *ast.FieldList) {
 	if list == nil {
 		return
 	}
@@ -489,16 +528,84 @@ func (r *resolver) walkFieldList(scope *ast.Scope, list *ast.FieldList, kind ast
 		if f.Type != nil {
 			ast.Walk(r, f.Type)
 		}
-		r.declare(f, nil, scope, kind, f.Names...)
 	}
 }
 
-func (r *resolver) walkBody(scope *ast.Scope, body *ast.BlockStmt) {
+func (r *resolver) declareList(list *ast.FieldList, kind ast.ObjKind) {
+	if list == nil {
+		return
+	}
+	for _, f := range list.List {
+		r.declare(f, nil, r.topScope, kind, f.Names...)
+	}
+}
+
+func (r *resolver) walkRecv(recv *ast.FieldList) {
+	// If our receiver has receiver type parameters, we must declare them before
+	// trying to resolve the rest of the receiver, and avoid re-resolving the
+	// type parameter identifiers.
+	if recv == nil || len(recv.List) == 0 {
+		return // nothing to do
+	}
+	typ := recv.List[0].Type
+	if ptr, ok := typ.(*ast.StarExpr); ok {
+		typ = ptr.X
+	}
+
+	var declareExprs []ast.Expr // exprs to declare
+	var resolveExprs []ast.Expr // exprs to resolve
+	switch typ := typ.(type) {
+	case *ast.IndexExpr:
+		declareExprs = []ast.Expr{typ.Index}
+		resolveExprs = append(resolveExprs, typ.X)
+	case *ast.IndexListExpr:
+		declareExprs = typ.Indices
+		resolveExprs = append(resolveExprs, typ.X)
+	default:
+		resolveExprs = append(resolveExprs, typ)
+	}
+	for _, expr := range declareExprs {
+		if id, _ := expr.(*ast.Ident); id != nil {
+			r.declare(expr, nil, r.topScope, ast.Typ, id)
+		} else {
+			// The receiver type parameter expression is invalid, but try to resolve
+			// it anyway for consistency.
+			resolveExprs = append(resolveExprs, expr)
+		}
+	}
+	for _, expr := range resolveExprs {
+		if expr != nil {
+			ast.Walk(r, expr)
+		}
+	}
+	// The receiver is invalid, but try to resolve it anyway for consistency.
+	for _, f := range recv.List[1:] {
+		if f.Type != nil {
+			ast.Walk(r, f.Type)
+		}
+	}
+}
+
+func (r *resolver) walkFieldList(list *ast.FieldList, kind ast.ObjKind) {
+	if list == nil {
+		return
+	}
+	r.resolveList(list)
+	r.declareList(list, kind)
+}
+
+// walkTParams is like walkFieldList, but declares type parameters eagerly so
+// that they may be resolved in the constraint expressions held in the field
+// Type.
+func (r *resolver) walkTParams(list *ast.FieldList) {
+	r.declareList(list, ast.Typ)
+	r.resolveList(list)
+}
+
+func (r *resolver) walkBody(body *ast.BlockStmt) {
 	if body == nil {
 		return
 	}
-	r.topScope = scope // open function scope
-	defer r.closeScope()
 	r.openLabelScope()
 	defer r.closeLabelScope()
 	r.walkStmts(body.List)

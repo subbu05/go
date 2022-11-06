@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build linux
-// +build linux
 
 package syscall_test
 
@@ -78,8 +77,10 @@ func TestSCMCredentials(t *testing.T) {
 			if sys, ok := err.(*os.SyscallError); ok {
 				err = sys.Err
 			}
-			if err != syscall.EPERM {
-				t.Fatalf("WriteMsgUnix failed with %v, want EPERM", err)
+			switch err {
+			case syscall.EPERM, syscall.EINVAL:
+			default:
+				t.Fatalf("WriteMsgUnix failed with %v, want EPERM or EINVAL", err)
 			}
 		}
 
@@ -105,8 +106,8 @@ func TestSCMCredentials(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadMsgUnix: %v", err)
 		}
-		if flags != 0 {
-			t.Fatalf("ReadMsgUnix flags = 0x%x, want 0", flags)
+		if flags != syscall.MSG_CMSG_CLOEXEC {
+			t.Fatalf("ReadMsgUnix flags = %#x, want %#x (MSG_CMSG_CLOEXEC)", flags, syscall.MSG_CMSG_CLOEXEC)
 		}
 		if n != tt.dataLen {
 			t.Fatalf("ReadMsgUnix n = %d, want %d", n, tt.dataLen)

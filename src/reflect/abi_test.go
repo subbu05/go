@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build goexperiment.regabi
-//go:build goexperiment.regabi
+//go:build goexperiment.regabiargs
 
 package reflect_test
 
 import (
 	"internal/abi"
+	"math"
 	"math/rand"
 	"reflect"
 	"runtime"
@@ -16,6 +16,9 @@ import (
 	"testing/quick"
 )
 
+// As of early May 2021 this is no longer necessary for amd64,
+// but it remains in case this is needed for the next register abi port.
+// TODO (1.18) If enabling register ABI on additional architectures turns out not to need this, remove it.
 type MagicLastTypeNameForTestingRegisterABI struct{}
 
 func TestMethodValueCallABI(t *testing.T) {
@@ -30,7 +33,7 @@ func TestMethodValueCallABI(t *testing.T) {
 	// for us, so there isn't a whole lot to do. Let's just
 	// make sure that we can pass register and stack arguments
 	// through. The exact combination is not super important.
-	makeMethodValue := func(method string) (*StructWithMethods, interface{}) {
+	makeMethodValue := func(method string) (*StructWithMethods, any) {
 		s := new(StructWithMethods)
 		v := reflect.ValueOf(s).MethodByName(method)
 		return s, v.Interface()
@@ -76,7 +79,34 @@ func TestMethodValueCallABI(t *testing.T) {
 		t.Errorf("bad method value call: got %#v, want %#v", r2, a2)
 	}
 	if s.Value != 3 {
-		t.Errorf("bad method value call: failed to set s.Value: got %d, want %d", s.Value, 1)
+		t.Errorf("bad method value call: failed to set s.Value: got %d, want %d", s.Value, 3)
+	}
+
+	s, i = makeMethodValue("ValueRegMethodSpillInt")
+	f3 := i.(func(StructFillRegs, int, MagicLastTypeNameForTestingRegisterABI) (StructFillRegs, int))
+	r3a, r3b := f3(a2, 42, MagicLastTypeNameForTestingRegisterABI{})
+	if r3a != a2 {
+		t.Errorf("bad method value call: got %#v, want %#v", r3a, a2)
+	}
+	if r3b != 42 {
+		t.Errorf("bad method value call: got %#v, want %#v", r3b, 42)
+	}
+	if s.Value != 4 {
+		t.Errorf("bad method value call: failed to set s.Value: got %d, want %d", s.Value, 4)
+	}
+
+	s, i = makeMethodValue("ValueRegMethodSpillPtr")
+	f4 := i.(func(StructFillRegs, *byte, MagicLastTypeNameForTestingRegisterABI) (StructFillRegs, *byte))
+	vb := byte(10)
+	r4a, r4b := f4(a2, &vb, MagicLastTypeNameForTestingRegisterABI{})
+	if r4a != a2 {
+		t.Errorf("bad method value call: got %#v, want %#v", r4a, a2)
+	}
+	if r4b != &vb {
+		t.Errorf("bad method value call: got %#v, want %#v", r4b, &vb)
+	}
+	if s.Value != 5 {
+		t.Errorf("bad method value call: failed to set s.Value: got %d, want %d", s.Value, 5)
 	}
 }
 
@@ -107,6 +137,20 @@ func (m *StructWithMethods) RegsAndStackCall(s StructFewRegs, a [4]uint64, _ Mag
 func (m *StructWithMethods) SpillStructCall(s StructFillRegs, _ MagicLastTypeNameForTestingRegisterABI) StructFillRegs {
 	m.Value = 3
 	return s
+}
+
+// When called as a method value, i is passed on the stack.
+// When called as a method, i is passed in a register.
+func (m *StructWithMethods) ValueRegMethodSpillInt(s StructFillRegs, i int, _ MagicLastTypeNameForTestingRegisterABI) (StructFillRegs, int) {
+	m.Value = 4
+	return s, i
+}
+
+// When called as a method value, i is passed on the stack.
+// When called as a method, i is passed in a register.
+func (m *StructWithMethods) ValueRegMethodSpillPtr(s StructFillRegs, i *byte, _ MagicLastTypeNameForTestingRegisterABI) (StructFillRegs, *byte) {
+	m.Value = 5
+	return s, i
 }
 
 func TestReflectCallABI(t *testing.T) {
@@ -212,7 +256,7 @@ func TestReflectMakeFuncCallABI(t *testing.T) {
 	})
 }
 
-var abiCallTestCases = []interface{}{
+var abiCallTestCases = []any{
 	passNone,
 	passInt,
 	passInt8,
@@ -501,13 +545,14 @@ func passEmptyStruct(a int, b struct{}, c float64) (int, struct{}, float64) {
 
 // This test case forces a large argument to the stack followed by more
 // in-register arguments.
+//
 //go:registerparams
 //go:noinline
 func passStruct10AndSmall(a Struct10, b byte, c uint) (Struct10, byte, uint) {
 	return a, b, c
 }
 
-var abiMakeFuncTestCases = []interface{}{
+var abiMakeFuncTestCases = []any{
 	callArgsNone,
 	callArgsInt,
 	callArgsInt8,
@@ -917,4 +962,28 @@ func genValue(t *testing.T, typ reflect.Type, r *rand.Rand) reflect.Value {
 		t.Fatal("failed to generate value")
 	}
 	return v
+}
+
+func TestSignalingNaNArgument(t *testing.T) {
+	v := reflect.ValueOf(func(x float32) {
+		// make sure x is a signaling NaN.
+		u := math.Float32bits(x)
+		if u != snan {
+			t.Fatalf("signaling NaN not correct: %x\n", u)
+		}
+	})
+	v.Call([]reflect.Value{reflect.ValueOf(math.Float32frombits(snan))})
+}
+
+func TestSignalingNaNReturn(t *testing.T) {
+	v := reflect.ValueOf(func() float32 {
+		return math.Float32frombits(snan)
+	})
+	var x float32
+	reflect.ValueOf(&x).Elem().Set(v.Call(nil)[0])
+	// make sure x is a signaling NaN.
+	u := math.Float32bits(x)
+	if u != snan {
+		t.Fatalf("signaling NaN not correct: %x\n", u)
+	}
 }

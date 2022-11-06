@@ -117,10 +117,10 @@ import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
-	"cmd/internal/objabi"
 	"cmd/internal/src"
 	"cmd/internal/sys"
 	"fmt"
+	"internal/buildcfg"
 	"math/bits"
 	"unsafe"
 )
@@ -146,6 +146,7 @@ func regalloc(f *Func) {
 	var s regAllocState
 	s.init(f)
 	s.regalloc(f)
+	s.close()
 }
 
 type register uint8
@@ -357,6 +358,12 @@ func (s *regAllocState) clobberRegs(m regMask) {
 // setOrig records that c's original value is the same as
 // v's original value.
 func (s *regAllocState) setOrig(c *Value, v *Value) {
+	if int(c.ID) >= cap(s.orig) {
+		x := s.f.Cache.allocValueSlice(int(c.ID) + 1)
+		copy(x, s.orig)
+		s.f.Cache.freeValueSlice(s.orig)
+		s.orig = x
+	}
 	for int(c.ID) >= len(s.orig) {
 		s.orig = append(s.orig, nil)
 	}
@@ -559,7 +566,8 @@ func (s *regAllocState) allocValToReg(v *Value, mask regMask, nospill bool, pos 
 func isLeaf(f *Func) bool {
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if opcodeTable[v.Op].call {
+			if v.Op.IsCall() && !v.Op.IsTailCall() {
+				// tail call is not counted as it does not save the return PC or need a frame
 				return false
 			}
 		}
@@ -609,7 +617,7 @@ func (s *regAllocState) init(f *Func) {
 	if s.f.Config.hasGReg {
 		s.allocatable &^= 1 << s.GReg
 	}
-	if objabi.FramePointerEnabled && s.f.Config.FPReg >= 0 {
+	if buildcfg.FramePointerEnabled && s.f.Config.FPReg >= 0 {
 		s.allocatable &^= 1 << uint(s.f.Config.FPReg)
 	}
 	if s.f.Config.LinkReg != -1 {
@@ -620,20 +628,22 @@ func (s *regAllocState) init(f *Func) {
 	}
 	if s.f.Config.ctxt.Flag_dynlink {
 		switch s.f.Config.arch {
-		case "amd64":
-			s.allocatable &^= 1 << 15 // R15
-		case "arm":
-			s.allocatable &^= 1 << 9 // R9
-		case "ppc64le": // R2 already reserved.
-			// nothing to do
-		case "arm64":
-			// nothing to do?
 		case "386":
 			// nothing to do.
 			// Note that for Flag_shared (position independent code)
 			// we do need to be careful, but that carefulness is hidden
 			// in the rewrite rules so we always have a free register
-			// available for global load/stores. See gen/386.rules (search for Flag_shared).
+			// available for global load/stores. See _gen/386.rules (search for Flag_shared).
+		case "amd64":
+			s.allocatable &^= 1 << 15 // R15
+		case "arm":
+			s.allocatable &^= 1 << 9 // R9
+		case "arm64":
+			// nothing to do
+		case "ppc64le": // R2 already reserved.
+			// nothing to do
+		case "riscv64": // X3 (aka GP) and X4 (aka TP) already reserved.
+			// nothing to do
 		case "s390x":
 			s.allocatable &^= 1 << 11 // R11
 		default:
@@ -661,7 +671,7 @@ func (s *regAllocState) init(f *Func) {
 		s.f.Cache.regallocValues = make([]valState, nv)
 	}
 	s.values = s.f.Cache.regallocValues
-	s.orig = make([]*Value, nv)
+	s.orig = s.f.Cache.allocValueSlice(nv)
 	s.copies = make(map[*Value]bool)
 	for _, b := range s.visitOrder {
 		for _, v := range b.Values {
@@ -723,6 +733,10 @@ func (s *regAllocState) init(f *Func) {
 		// TODO: honor GOCLOBBERDEADHASH, or maybe GOSSAHASH.
 		s.doClobber = true
 	}
+}
+
+func (s *regAllocState) close() {
+	s.f.Cache.freeValueSlice(s.orig)
 }
 
 // Adds a use record for id at distance dist from the start of the block.
@@ -1234,7 +1248,7 @@ func (s *regAllocState) regalloc(f *Func) {
 				desired.clobber(j.regs)
 				desired.add(v.Args[j.idx].ID, pickReg(j.regs))
 			}
-			if opcodeTable[v.Op].resultInArg0 {
+			if opcodeTable[v.Op].resultInArg0 || v.Op == OpAMD64ADDQconst || v.Op == OpAMD64ADDLconst || v.Op == OpSelect0 {
 				if opcodeTable[v.Op].commutative {
 					desired.addList(v.Args[1].ID, prefs)
 				}
@@ -1287,7 +1301,7 @@ func (s *regAllocState) regalloc(f *Func) {
 				}
 				b.Values = append(b.Values, v)
 				s.advanceUses(v)
-				goto issueSpill
+				continue
 			}
 			if v.Op == OpGetG && s.f.Config.hasGReg {
 				// use hardware g register
@@ -1297,7 +1311,7 @@ func (s *regAllocState) regalloc(f *Func) {
 				s.assignReg(s.GReg, v, v)
 				b.Values = append(b.Values, v)
 				s.advanceUses(v)
-				goto issueSpill
+				continue
 			}
 			if v.Op == OpArg {
 				// Args are "pre-spilled" values. We don't allocate
@@ -1377,12 +1391,58 @@ func (s *regAllocState) regalloc(f *Func) {
 				}
 			}
 
-			// Move arguments to registers. Process in an ordering defined
-			// by the register specification (most constrained first).
-			args = append(args[:0], v.Args...)
+			// Move arguments to registers.
+			// First, if an arg must be in a specific register and it is already
+			// in place, keep it.
+			args = append(args[:0], make([]*Value, len(v.Args))...)
+			for i, a := range v.Args {
+				if !s.values[a.ID].needReg {
+					args[i] = a
+				}
+			}
 			for _, i := range regspec.inputs {
 				mask := i.regs
-				if mask&s.values[args[i.idx].ID].regs == 0 {
+				if countRegs(mask) == 1 && mask&s.values[v.Args[i.idx].ID].regs != 0 {
+					args[i.idx] = s.allocValToReg(v.Args[i.idx], mask, true, v.Pos)
+				}
+			}
+			// Then, if an arg must be in a specific register and that
+			// register is free, allocate that one. Otherwise when processing
+			// another input we may kick a value into the free register, which
+			// then will be kicked out again.
+			// This is a common case for passing-in-register arguments for
+			// function calls.
+			for {
+				freed := false
+				for _, i := range regspec.inputs {
+					if args[i.idx] != nil {
+						continue // already allocated
+					}
+					mask := i.regs
+					if countRegs(mask) == 1 && mask&^s.used != 0 {
+						args[i.idx] = s.allocValToReg(v.Args[i.idx], mask, true, v.Pos)
+						// If the input is in other registers that will be clobbered by v,
+						// or the input is dead, free the registers. This may make room
+						// for other inputs.
+						oldregs := s.values[v.Args[i.idx].ID].regs
+						if oldregs&^regspec.clobbers == 0 || !s.liveAfterCurrentInstruction(v.Args[i.idx]) {
+							s.freeRegs(oldregs &^ mask &^ s.nospill)
+							freed = true
+						}
+					}
+				}
+				if !freed {
+					break
+				}
+			}
+			// Last, allocate remaining ones, in an ordering defined
+			// by the register specification (most constrained first).
+			for _, i := range regspec.inputs {
+				if args[i.idx] != nil {
+					continue // already allocated
+				}
+				mask := i.regs
+				if mask&s.values[v.Args[i.idx].ID].regs == 0 {
 					// Need a new register for the input.
 					mask &= s.allocatable
 					mask &^= s.nospill
@@ -1401,7 +1461,7 @@ func (s *regAllocState) regalloc(f *Func) {
 						mask &^= desired.avoid
 					}
 				}
-				args[i.idx] = s.allocValToReg(args[i.idx], mask, true, v.Pos)
+				args[i.idx] = s.allocValToReg(v.Args[i.idx], mask, true, v.Pos)
 			}
 
 			// If the output clobbers the input register, make sure we have
@@ -1447,9 +1507,9 @@ func (s *regAllocState) regalloc(f *Func) {
 					goto ok
 				}
 
-				// Try to move an input to the desired output.
+				// Try to move an input to the desired output, if allowed.
 				for _, r := range dinfo[idx].out {
-					if r != noRegister && m>>r&1 != 0 {
+					if r != noRegister && (m&regspec.outputs[0].regs)>>r&1 != 0 {
 						m = regMask(1) << r
 						args[0] = s.allocValToReg(v.Args[0], m, true, v.Pos)
 						// Note: we update args[0] so the instruction will
@@ -1523,6 +1583,9 @@ func (s *regAllocState) regalloc(f *Func) {
 						if !opcodeTable[v.Op].commutative {
 							// Output must use the same register as input 0.
 							r := register(s.f.getHome(args[0].ID).(*Register).num)
+							if mask>>r&1 == 0 {
+								s.f.Fatalf("resultInArg0 value's input %v cannot be an output of %s", s.f.getHome(args[0].ID).(*Register), v.LongString())
+							}
 							mask = regMask(1) << r
 						} else {
 							// Output must use the same register as input 0 or 1.
@@ -1546,11 +1609,13 @@ func (s *regAllocState) regalloc(f *Func) {
 							}
 						}
 					}
-					for _, r := range dinfo[idx].out {
-						if r != noRegister && (mask&^s.used)>>r&1 != 0 {
-							// Desired register is allowed and unused.
-							mask = regMask(1) << r
-							break
+					if out.idx == 0 { // desired registers only apply to the first element of a tuple result
+						for _, r := range dinfo[idx].out {
+							if r != noRegister && (mask&^s.used)>>r&1 != 0 {
+								// Desired register is allowed and unused.
+								mask = regMask(1) << r
+								break
+							}
 						}
 					}
 					// Avoid registers we're saving for other values.
@@ -1604,8 +1669,6 @@ func (s *regAllocState) regalloc(f *Func) {
 				v.SetArg(i, a) // use register version of arguments
 			}
 			b.Values = append(b.Values, v)
-
-		issueSpill:
 		}
 
 		// Copy the control values - we need this so we can reduce the
@@ -1791,7 +1854,7 @@ func (s *regAllocState) regalloc(f *Func) {
 				if s.f.pass.debug > regDebug {
 					fmt.Printf("delete copied value %s\n", c.LongString())
 				}
-				c.RemoveArg(0)
+				c.resetArgs()
 				f.freeValue(c)
 				delete(s.copies, c)
 				progress = true
@@ -1816,21 +1879,8 @@ func (s *regAllocState) regalloc(f *Func) {
 }
 
 func (s *regAllocState) placeSpills() {
-	f := s.f
-
-	// Precompute some useful info.
-	phiRegs := make([]regMask, f.NumBlocks())
-	for _, b := range s.visitOrder {
-		var m regMask
-		for _, v := range b.Values {
-			if v.Op != OpPhi {
-				break
-			}
-			if r, ok := f.getHome(v.ID).(*Register); ok {
-				m |= regMask(1) << uint(r.num)
-			}
-		}
-		phiRegs[b.ID] = m
+	mustBeFirst := func(op Op) bool {
+		return op.isLoweredGetClosurePtr() || op == OpPhi || op == OpArgIntReg || op == OpArgFloatReg
 	}
 
 	// Start maps block IDs to the list of spills
@@ -1922,7 +1972,7 @@ func (s *regAllocState) placeSpills() {
 		// Put the spill in the best block we found.
 		spill.Block = best
 		spill.AddArg(bestArg)
-		if best == v.Block && v.Op != OpPhi {
+		if best == v.Block && !mustBeFirst(v.Op) {
 			// Place immediately after v.
 			after[v.ID] = append(after[v.ID], spill)
 		} else {
@@ -1934,15 +1984,15 @@ func (s *regAllocState) placeSpills() {
 	// Insert spill instructions into the block schedules.
 	var oldSched []*Value
 	for _, b := range s.visitOrder {
-		nphi := 0
+		nfirst := 0
 		for _, v := range b.Values {
-			if v.Op != OpPhi {
+			if !mustBeFirst(v.Op) {
 				break
 			}
-			nphi++
+			nfirst++
 		}
-		oldSched = append(oldSched[:0], b.Values[nphi:]...)
-		b.Values = b.Values[:nphi]
+		oldSched = append(oldSched[:0], b.Values[nfirst:]...)
+		b.Values = b.Values[:nfirst]
 		b.Values = append(b.Values, start[b.ID]...)
 		for _, v := range oldSched {
 			b.Values = append(b.Values, v)
@@ -2457,10 +2507,10 @@ func (s *regAllocState) computeLive() {
 	s.desired = make([]desiredState, f.NumBlocks())
 	var phis []*Value
 
-	live := f.newSparseMap(f.NumValues())
-	defer f.retSparseMap(live)
-	t := f.newSparseMap(f.NumValues())
-	defer f.retSparseMap(t)
+	live := f.newSparseMapPos(f.NumValues())
+	defer f.retSparseMapPos(live)
+	t := f.newSparseMapPos(f.NumValues())
+	defer f.retSparseMapPos(t)
 
 	// Keep track of which value we want in each register.
 	var desired desiredState
@@ -2542,7 +2592,12 @@ func (s *regAllocState) computeLive() {
 					desired.add(v.Args[j.idx].ID, pickReg(j.regs))
 				}
 				// Set desired register of input 0 if this is a 2-operand instruction.
-				if opcodeTable[v.Op].resultInArg0 {
+				if opcodeTable[v.Op].resultInArg0 || v.Op == OpAMD64ADDQconst || v.Op == OpAMD64ADDLconst || v.Op == OpSelect0 {
+					// ADDQconst is added here because we want to treat it as resultInArg0 for
+					// the purposes of desired registers, even though it is not an absolute requirement.
+					// This is because we'd rather implement it as ADDQ instead of LEAQ.
+					// Same for ADDLconst
+					// Select0 is added here to propagate the desired register to the tuple-generating instruction.
 					if opcodeTable[v.Op].commutative {
 						desired.addList(v.Args[1].ID, prefs)
 					}
@@ -2584,7 +2639,7 @@ func (s *regAllocState) computeLive() {
 					d := e.val + delta
 					if !t.contains(e.key) || d < t.get(e.key) {
 						update = true
-						t.set(e.key, d, e.aux)
+						t.set(e.key, d, e.pos)
 					}
 				}
 				// Also add the correct arg from the saved phi values.
@@ -2607,7 +2662,7 @@ func (s *regAllocState) computeLive() {
 					l = make([]liveInfo, 0, t.size())
 				}
 				for _, e := range t.contents() {
-					l = append(l, liveInfo{e.key, e.val, e.aux})
+					l = append(l, liveInfo{e.key, e.val, e.pos})
 				}
 				s.live[p.ID] = l
 				changed = true
@@ -2667,6 +2722,8 @@ type desiredStateEntry struct {
 	ID ID
 	// Registers it would like to be in, in priority order.
 	// Unused slots are filled with noRegister.
+	// For opcodes that return tuples, we track desired registers only
+	// for the first element of the tuple.
 	regs [4]register
 }
 

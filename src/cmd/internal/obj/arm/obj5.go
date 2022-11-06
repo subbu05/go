@@ -34,6 +34,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
+	"internal/buildcfg"
 	"log"
 )
 
@@ -64,7 +65,7 @@ func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
 				ctxt.Diag("%v: TLS MRC instruction must write to R0 as it might get translated into a BL instruction", p.Line())
 			}
 
-			if objabi.GOARM < 7 {
+			if buildcfg.GOARM < 7 {
 				// Replace it with BL runtime.read_tls_fallback(SB) for ARM CPUs that lack the tls extension.
 				if progedit_tlsfallback == nil {
 					progedit_tlsfallback = ctxt.Lookup("runtime.read_tls_fallback")
@@ -633,6 +634,61 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 }
 
 func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
+	if c.ctxt.Flag_maymorestack != "" {
+		// Save LR and make room for REGCTXT.
+		const frameSize = 8
+		// MOVW.W R14,$-8(SP)
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVW
+		p.Scond |= C_WBIT
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGLINK
+		p.To.Type = obj.TYPE_MEM
+		p.To.Offset = -frameSize
+		p.To.Reg = REGSP
+		p.Spadj = frameSize
+
+		// MOVW REGCTXT, 4(SP)
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVW
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = REGCTXT
+		p.To.Type = obj.TYPE_MEM
+		p.To.Offset = 4
+		p.To.Reg = REGSP
+
+		// CALL maymorestack
+		p = obj.Appendp(p, c.newprog)
+		p.As = obj.ACALL
+		p.To.Type = obj.TYPE_BRANCH
+		// See ../x86/obj6.go
+		p.To.Sym = c.ctxt.LookupABI(c.ctxt.Flag_maymorestack, c.cursym.ABI())
+
+		// Restore REGCTXT and LR.
+
+		// MOVW 4(SP), REGCTXT
+		p = obj.Appendp(p, c.newprog)
+		p.As = AMOVW
+		p.From.Type = obj.TYPE_MEM
+		p.From.Offset = 4
+		p.From.Reg = REGSP
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGCTXT
+
+		// MOVW.P 8(SP), R14
+		p.As = AMOVW
+		p.Scond |= C_PBIT
+		p.From.Type = obj.TYPE_MEM
+		p.From.Offset = frameSize
+		p.From.Reg = REGSP
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = REGLINK
+		p.Spadj = -frameSize
+	}
+
+	// Jump back to here after morestack returns.
+	startPred := p
+
 	// MOVW g_stackguard(g), R1
 	p = obj.Appendp(p, c.newprog)
 
@@ -760,7 +816,7 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	b := obj.Appendp(pcdata, c.newprog)
 	b.As = obj.AJMP
 	b.To.Type = obj.TYPE_BRANCH
-	b.To.SetTarget(c.cursym.Func().Text.Link)
+	b.To.SetTarget(startPred.Link)
 	b.Spadj = +framesize
 
 	return end

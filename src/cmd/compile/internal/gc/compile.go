@@ -13,10 +13,12 @@ import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/liveness"
+	"cmd/compile/internal/objw"
 	"cmd/compile/internal/ssagen"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/walk"
+	"cmd/internal/obj"
 )
 
 // "Portable" code generation.
@@ -42,11 +44,15 @@ func enqueueFunc(fn *ir.Func) {
 
 	if len(fn.Body) == 0 {
 		// Initialize ABI wrappers if necessary.
-		ssagen.InitLSym(fn, false)
+		ir.InitLSym(fn, false)
 		types.CalcSize(fn.Type())
 		a := ssagen.AbiForBodylessFuncStackMap(fn)
 		abiInfo := a.ABIAnalyzeFuncType(fn.Type().FuncType()) // abiInfo has spill/home locations for wrapper
 		liveness.WriteFuncMap(fn, abiInfo)
+		if fn.ABI == obj.ABI0 {
+			x := ssagen.EmitArgInfo(fn, abiInfo)
+			objw.Global(x, int32(len(x.P)), obj.RODATA|obj.LOCAL)
+		}
 		return
 	}
 
@@ -76,7 +82,7 @@ func prepareFunc(fn *ir.Func) {
 	// Set up the function's LSym early to avoid data races with the assemblers.
 	// Do this before walk, as walk needs the LSym to set attributes/relocations
 	// (e.g. in MarkTypeUsedInInterface).
-	ssagen.InitLSym(fn, true)
+	ir.InitLSym(fn, true)
 
 	// Calculate parameter offsets.
 	types.CalcSize(fn.Type())
@@ -113,38 +119,69 @@ func compileFunctions() {
 		})
 	}
 
-	// We queue up a goroutine per function that needs to be
-	// compiled, but require them to grab an available worker ID
-	// before doing any substantial work to limit parallelism.
-	workerIDs := make(chan int, base.Flag.LowerC)
-	for i := 0; i < base.Flag.LowerC; i++ {
-		workerIDs <- i
+	// By default, we perform work right away on the current goroutine
+	// as the solo worker.
+	queue := func(work func(int)) {
+		work(0)
+	}
+
+	if nWorkers := base.Flag.LowerC; nWorkers > 1 {
+		// For concurrent builds, we allow the work queue
+		// to grow arbitrarily large, but only nWorkers work items
+		// can be running concurrently.
+		workq := make(chan func(int))
+		done := make(chan int)
+		go func() {
+			ids := make([]int, nWorkers)
+			for i := range ids {
+				ids[i] = i
+			}
+			var pending []func(int)
+			for {
+				select {
+				case work := <-workq:
+					pending = append(pending, work)
+				case id := <-done:
+					ids = append(ids, id)
+				}
+				for len(pending) > 0 && len(ids) > 0 {
+					work := pending[len(pending)-1]
+					id := ids[len(ids)-1]
+					pending = pending[:len(pending)-1]
+					ids = ids[:len(ids)-1]
+					go func() {
+						work(id)
+						done <- id
+					}()
+				}
+			}
+		}()
+		queue = func(work func(int)) {
+			workq <- work
+		}
 	}
 
 	var wg sync.WaitGroup
-	var asyncCompile func(*ir.Func)
-	asyncCompile = func(fn *ir.Func) {
-		wg.Add(1)
-		go func() {
-			worker := <-workerIDs
-			ssagen.Compile(fn, worker)
-			workerIDs <- worker
-
-			// Done compiling fn. Schedule it's closures for compilation.
-			for _, closure := range fn.Closures {
-				asyncCompile(closure)
-			}
-			wg.Done()
-		}()
+	var compile func([]*ir.Func)
+	compile = func(fns []*ir.Func) {
+		wg.Add(len(fns))
+		for _, fn := range fns {
+			fn := fn
+			queue(func(worker int) {
+				ssagen.Compile(fn, worker)
+				compile(fn.Closures)
+				wg.Done()
+			})
+		}
 	}
 
 	types.CalcSizeDisabled = true // not safe to calculate sizes concurrently
 	base.Ctxt.InParallel = true
-	for _, fn := range compilequeue {
-		asyncCompile(fn)
-	}
+
+	compile(compilequeue)
 	compilequeue = nil
 	wg.Wait()
+
 	base.Ctxt.InParallel = false
 	types.CalcSizeDisabled = false
 }

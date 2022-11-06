@@ -5,11 +5,12 @@
 #include "go_asm.h"
 #include "go_tls.h"
 #include "textflag.h"
+#include "time_windows.h"
 
 // Note: For system ABI, R0-R3 are args, R4-R11 are callee-save.
 
 // void runtime·asmstdcall(void *c);
-TEXT runtime·asmstdcall<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·asmstdcall(SB),NOSPLIT|NOFRAME,$0
 	MOVM.DB.W [R4, R5, R14], (R13)	// push {r4, r5, lr}
 	MOVW	R0, R4			// put libcall * in r4
 	MOVW	R13, R5			// save stack pointer in r5
@@ -96,8 +97,8 @@ TEXT runtime·badsignal2(SB),NOSPLIT|NOFRAME,$0
 	MOVW	runtime·_WriteFile(SB), R12
 	BL	(R12)
 
-	MOVW	R4, R13			// restore SP
-	MOVM.IA.W (R13), [R4, R15]	// pop {r4, pc}
+	// Does not return.
+	B	runtime·abort(SB)
 
 TEXT runtime·getlasterror(SB),NOSPLIT,$0
 	MRC	15, 0, R0, C13, C0, 2
@@ -122,8 +123,14 @@ TEXT sigtramp<>(SB),NOSPLIT|NOFRAME,$0
 	MOVW	R1, R7			// Save param1
 
 	BL      runtime·load_g(SB)
-	CMP	$0, g			// is there a current g?
-	BL.EQ	runtime·badsignal2(SB)
+	CMP	$0,	g		// is there a current g?
+	BNE	g_ok
+	ADD	$(8+20), R13	// free locals
+	MOVM.IA.W (R13), [R3, R4-R11, R14]	// pop {r3, r4-r11, lr}
+	MOVW	$0, R0		// continue 
+	BEQ	return
+
+g_ok:
 
 	// save g and SP in case of stack switch
 	MOVW	R13, 24(R13)
@@ -221,21 +228,21 @@ TEXT sigresume<>(SB),NOSPLIT|NOFRAME,$0
 	MOVW	R0, R13
 	B	(R1)
 
-TEXT runtime·exceptiontramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·exceptiontramp(SB),NOSPLIT|NOFRAME,$0
 	MOVW	$runtime·exceptionhandler(SB), R1
 	B	sigtramp<>(SB)
 
-TEXT runtime·firstcontinuetramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·firstcontinuetramp(SB),NOSPLIT|NOFRAME,$0
 	MOVW	$runtime·firstcontinuehandler(SB), R1
 	B	sigtramp<>(SB)
 
-TEXT runtime·lastcontinuetramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·lastcontinuetramp(SB),NOSPLIT|NOFRAME,$0
 	MOVW	$runtime·lastcontinuehandler(SB), R1
 	B	sigtramp<>(SB)
 
 GLOBL runtime·cbctxts(SB), NOPTR, $4
 
-TEXT runtime·callbackasm1<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·callbackasm1(SB),NOSPLIT|NOFRAME,$0
 	// On entry, the trampoline in zcallback_windows_arm.s left
 	// the callback index in R12 (which is volatile in the C ABI).
 
@@ -274,7 +281,7 @@ TEXT runtime·callbackasm1<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
 	B	(R12)	// return
 
 // uint32 tstart_stdcall(M *newm);
-TEXT runtime·tstart_stdcall<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·tstart_stdcall(SB),NOSPLIT|NOFRAME,$0
 	MOVM.DB.W [R4-R11, R14], (R13)		// push {r4-r11, lr}
 
 	MOVW	m_g0(R0), g
@@ -318,7 +325,7 @@ TEXT runtime·usleep2(SB),NOSPLIT|NOFRAME,$0-4
 // Runs on OS stack.
 // duration (in -100ns units) is in dt+0(FP).
 // g is valid.
-// TODO: neeeds to be implemented properly.
+// TODO: needs to be implemented properly.
 TEXT runtime·usleep2HighRes(SB),NOSPLIT|NOFRAME,$0-4
 	B	runtime·abort(SB)
 
@@ -335,21 +342,11 @@ TEXT runtime·switchtothread(SB),NOSPLIT|NOFRAME,$0
 TEXT ·publicationBarrier(SB),NOSPLIT|NOFRAME,$0-0
 	B	runtime·armPublicationBarrier(SB)
 
-// never called (cgo not supported)
+// never called (this is a GOARM=7 platform)
 TEXT runtime·read_tls_fallback(SB),NOSPLIT|NOFRAME,$0
 	MOVW	$0xabcd, R0
 	MOVW	R0, (R0)
 	RET
-
-// See https://wrkhpi.wordpress.com/2007/08/09/getting-os-information-the-kuser_shared_data-structure/
-// Archived copy at:
-// http://web.archive.org/web/20210411000829/https://wrkhpi.wordpress.com/2007/08/09/getting-os-information-the-kuser_shared_data-structure/
-// Must read hi1, then lo, then hi2. The snapshot is valid if hi1 == hi2.
-#define _INTERRUPT_TIME 0x7ffe0008
-#define _SYSTEM_TIME 0x7ffe0014
-#define time_lo 0
-#define time_hi1 4
-#define time_hi2 8
 
 TEXT runtime·nanotime1(SB),NOSPLIT|NOFRAME,$0-8
 	MOVW	$0, R0
@@ -359,7 +356,9 @@ TEXT runtime·nanotime1(SB),NOSPLIT|NOFRAME,$0-8
 	MOVW	$_INTERRUPT_TIME, R3
 loop:
 	MOVW	time_hi1(R3), R1
+	DMB	MB_ISH
 	MOVW	time_lo(R3), R0
+	DMB	MB_ISH
 	MOVW	time_hi2(R3), R2
 	CMP	R1, R2
 	BNE	loop
@@ -375,82 +374,6 @@ loop:
 	RET
 useQPC:
 	B	runtime·nanotimeQPC(SB)		// tail call
-
-TEXT time·now(SB),NOSPLIT|NOFRAME,$0-20
-	MOVW    $0, R0
-	MOVB    runtime·useQPCTime(SB), R0
-	CMP	$0, R0
-	BNE	useQPC
-	MOVW	$_INTERRUPT_TIME, R3
-loop:
-	MOVW	time_hi1(R3), R1
-	MOVW	time_lo(R3), R0
-	MOVW	time_hi2(R3), R2
-	CMP	R1, R2
-	BNE	loop
-
-	// wintime = R1:R0, multiply by 100
-	MOVW	$100, R2
-	MULLU	R0, R2, (R4, R3)    // R4:R3 = R1:R0 * R2
-	MULA	R1, R2, R4, R4
-
-	// wintime*100 = R4:R3
-	MOVW	R3, mono+12(FP)
-	MOVW	R4, mono+16(FP)
-
-	MOVW	$_SYSTEM_TIME, R3
-wall:
-	MOVW	time_hi1(R3), R1
-	MOVW	time_lo(R3), R0
-	MOVW	time_hi2(R3), R2
-	CMP	R1, R2
-	BNE	wall
-
-	// w = R1:R0 in 100ns untis
-	// convert to Unix epoch (but still 100ns units)
-	#define delta 116444736000000000
-	SUB.S   $(delta & 0xFFFFFFFF), R0
-	SBC     $(delta >> 32), R1
-
-	// Convert to nSec
-	MOVW    $100, R2
-	MULLU   R0, R2, (R4, R3)    // R4:R3 = R1:R0 * R2
-	MULA    R1, R2, R4, R4
-	// w = R2:R1 in nSec
-	MOVW    R3, R1	      // R4:R3 -> R2:R1
-	MOVW    R4, R2
-
-	// multiply nanoseconds by reciprocal of 10**9 (scaled by 2**61)
-	// to get seconds (96 bit scaled result)
-	MOVW	$0x89705f41, R3		// 2**61 * 10**-9
-	MULLU	R1,R3,(R6,R5)		// R7:R6:R5 = R2:R1 * R3
-	MOVW	$0,R7
-	MULALU	R2,R3,(R7,R6)
-
-	// unscale by discarding low 32 bits, shifting the rest by 29
-	MOVW	R6>>29,R6		// R7:R6 = (R7:R6:R5 >> 61)
-	ORR	R7<<3,R6
-	MOVW	R7>>29,R7
-
-	// subtract (10**9 * sec) from nsec to get nanosecond remainder
-	MOVW	$1000000000, R5	// 10**9
-	MULLU	R6,R5,(R9,R8)   // R9:R8 = R7:R6 * R5
-	MULA	R7,R5,R9,R9
-	SUB.S	R8,R1		// R2:R1 -= R9:R8
-	SBC	R9,R2
-
-	// because reciprocal was a truncated repeating fraction, quotient
-	// may be slightly too small -- adjust to make remainder < 10**9
-	CMP	R5,R1	// if remainder > 10**9
-	SUB.HS	R5,R1   //    remainder -= 10**9
-	ADD.HS	$1,R6	//    sec += 1
-
-	MOVW	R6,sec_lo+0(FP)
-	MOVW	R7,sec_hi+4(FP)
-	MOVW	R1,nsec+8(FP)
-	RET
-useQPC:
-	B	runtime·nowQPC(SB)		// tail call
 
 // save_g saves the g register (R10) into thread local memory
 // so that we can call externally compiled

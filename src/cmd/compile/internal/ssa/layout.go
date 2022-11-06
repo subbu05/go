@@ -12,33 +12,20 @@ func layout(f *Func) {
 }
 
 // Register allocation may use a different order which has constraints
-// imposed by the linear-scan algorithm. Note that f.pass here is
-// regalloc, so the switch is conditional on -d=ssa/regalloc/test=N
+// imposed by the linear-scan algorithm.
 func layoutRegallocOrder(f *Func) []*Block {
-
-	switch f.pass.test {
-	case 0: // layout order
-		return layoutOrder(f)
-	case 1: // existing block order
-		return f.Blocks
-	case 2: // reverse of postorder; legal, but usually not good.
-		po := f.postorder()
-		visitOrder := make([]*Block, len(po))
-		for i, b := range po {
-			j := len(po) - i - 1
-			visitOrder[j] = b
-		}
-		return visitOrder
-	}
-
-	return nil
+	// remnant of an experiment; perhaps there will be another.
+	return layoutOrder(f)
 }
 
 func layoutOrder(f *Func) []*Block {
 	order := make([]*Block, 0, f.NumBlocks())
-	scheduled := make([]bool, f.NumBlocks())
-	idToBlock := make([]*Block, f.NumBlocks())
-	indegree := make([]int, f.NumBlocks())
+	scheduled := f.Cache.allocBoolSlice(f.NumBlocks())
+	defer f.Cache.freeBoolSlice(scheduled)
+	idToBlock := f.Cache.allocBlockSlice(f.NumBlocks())
+	defer f.Cache.freeBlockSlice(idToBlock)
+	indegree := f.Cache.allocIntSlice(f.NumBlocks())
+	defer f.Cache.freeIntSlice(indegree)
 	posdegree := f.newSparseSet(f.NumBlocks()) // blocks with positive remaining degree
 	defer f.retSparseSet(posdegree)
 	// blocks with zero remaining degree. Use slice to simulate a LIFO queue to implement

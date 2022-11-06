@@ -5,14 +5,11 @@
 #include "go_asm.h"
 #include "go_tls.h"
 #include "textflag.h"
+#include "time_windows.h"
 #include "cgo/abi_amd64.h"
 
-// maxargs should be divisible by 2, as Windows stack
-// must be kept 16-byte aligned on syscall entry.
-#define maxargs 18
-
 // void runtime·asmstdcall(void *c);
-TEXT runtime·asmstdcall<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·asmstdcall(SB),NOSPLIT|NOFRAME,$0
 	// asmcgocall will put first argument into CX.
 	PUSHQ	CX			// save for later
 	MOVQ	libcall_fn(CX), AX
@@ -23,14 +20,14 @@ TEXT runtime·asmstdcall<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	0x30(GS), DI
 	MOVL	$0, 0x68(DI)
 
-	SUBQ	$(maxargs*8), SP	// room for args
+	SUBQ	$(const_maxArgs*8), SP	// room for args
 
 	// Fast version, do not store args on the stack.
 	CMPL	CX, $4
 	JLE	loadregs
 
 	// Check we have enough room for args.
-	CMPL	CX, $maxargs
+	CMPL	CX, $const_maxArgs
 	JLE	2(PC)
 	INT	$3			// not enough room -> crash
 
@@ -58,7 +55,7 @@ loadregs:
 	// Call stdcall function.
 	CALL	AX
 
-	ADDQ	$(maxargs*8), SP
+	ADDQ	$(const_maxArgs*8), SP
 
 	// Return result.
 	POPQ	CX
@@ -95,6 +92,8 @@ TEXT runtime·badsignal2(SB),NOSPLIT|NOFRAME,$48
 	MOVQ	runtime·_WriteFile(SB), AX
 	CALL	AX
 
+	// Does not return.
+	CALL	runtime·abort(SB)
 	RET
 
 // faster get/set last error
@@ -117,6 +116,7 @@ TEXT sigtramp<>(SB),NOSPLIT|NOFRAME,$0-0
 	// Make stack space for the rest of the function.
 	ADJSP	$48
 
+	MOVQ	CX, R13	// save exception address
 	MOVQ	AX, R15	// save handler address
 
 	// find g
@@ -148,20 +148,22 @@ TEXT sigtramp<>(SB),NOSPLIT|NOFRAME,$0-0
 	// and re-save old SP for restoring later.
 	// Adjust g0 stack by the space we're using and
 	// save SP at the same place on the g0 stack.
-	// The 32(DI) here must match the 32(SP) above.
+	// The 40(DI) here must match the 40(SP) above.
 	SUBQ	$(REGS_HOST_TO_ABI0_STACK + 48), DI
 	MOVQ	SP, 40(DI)
 	MOVQ	DI, SP
 
 g0:
-	MOVQ	0(CX), BX // ExceptionRecord*
-	MOVQ	8(CX), CX // Context*
+	MOVQ	0(R13), BX // ExceptionRecord*
+	MOVQ	8(R13), CX // Context*
 	MOVQ	BX, 0(SP)
 	MOVQ	CX, 8(SP)
 	MOVQ	DX, 16(SP)
 	CALL	R15	// call handler
 	// AX is set to report result back to Windows
 	MOVL	24(SP), AX
+
+	MOVQ	SP, DI // save g0 SP
 
 	// switch back to original stack and g
 	// no-op if we never left.
@@ -170,21 +172,63 @@ g0:
 	get_tls(BP)
 	MOVQ	DX, g(BP)
 
+	// if return value is CONTINUE_SEARCH, do not set up control
+	// flow guard workaround.
+	CMPQ	AX, $0
+	JEQ	done
+
+	// Check if we need to set up the control flow guard workaround.
+	// On Windows, the stack pointer in the context must lie within
+	// system stack limits when we resume from exception.
+	// Store the resume SP and PC in alternate registers
+	// and return to sigresume on the g0 stack.
+	// sigresume makes no use of the stack at all,
+	// loading SP from R8 and jumping to R9.
+	// Note that smashing R8 and R9 is only safe because we know sigpanic
+	// will not actually return to the original frame, so the registers
+	// are effectively dead. But this does mean we can't use the
+	// same mechanism for async preemption.
+	MOVQ	8(R13), CX
+	MOVQ	$sigresume<>(SB), BX
+	CMPQ	BX, context_rip(CX)
+	JEQ	done			// do not clobber saved SP/PC
+
+	// Save resume SP and PC into R8, R9.
+	MOVQ	context_rsp(CX), BX
+	MOVQ	BX, context_r8(CX)
+	MOVQ	context_rip(CX), BX
+	MOVQ	BX, context_r9(CX)
+
+	// Set up context record to return to sigresume on g0 stack
+	MOVD	DI, BX
+	MOVD	BX, context_rsp(CX)
+	MOVD	$sigresume<>(SB), BX
+	MOVD	BX, context_rip(CX)
+
 done:
 	ADJSP	$-48
 	POP_REGS_HOST_TO_ABI0()
 
 	RET
 
-TEXT runtime·exceptiontramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+// Trampoline to resume execution from exception handler.
+// This is part of the control flow guard workaround.
+// It switches stacks and jumps to the continuation address.
+// R8 and R9 are set above at the end of sigtramp<>
+// in the context that starts executing at sigresume<>.
+TEXT sigresume<>(SB),NOSPLIT|NOFRAME,$0
+	MOVQ	R8, SP
+	JMP	R9
+
+TEXT runtime·exceptiontramp(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	$runtime·exceptionhandler(SB), AX
 	JMP	sigtramp<>(SB)
 
-TEXT runtime·firstcontinuetramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-0
+TEXT runtime·firstcontinuetramp(SB),NOSPLIT|NOFRAME,$0-0
 	MOVQ	$runtime·firstcontinuehandler(SB), AX
 	JMP	sigtramp<>(SB)
 
-TEXT runtime·lastcontinuetramp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-0
+TEXT runtime·lastcontinuetramp(SB),NOSPLIT|NOFRAME,$0-0
 	MOVQ	$runtime·lastcontinuehandler(SB), AX
 	JMP	sigtramp<>(SB)
 
@@ -209,7 +253,7 @@ TEXT runtime·callbackasm1(SB),NOSPLIT,$0
 	ADDQ	$8, SP
 
 	// determine index into runtime·cbs table
-	MOVQ	$runtime·callbackasm<ABIInternal>(SB), DX
+	MOVQ	$runtime·callbackasm(SB), DX
 	SUBQ	DX, AX
 	MOVQ	$0, DX
 	MOVQ	$5, CX	// divide by 5 because each call instruction in runtime·callbacks is 5 bytes long
@@ -242,7 +286,7 @@ TEXT runtime·callbackasm1(SB),NOSPLIT,$0
 	RET
 
 // uint32 tstart_stdcall(M *newm);
-TEXT runtime·tstart_stdcall<ABIInternal>(SB),NOSPLIT,$0
+TEXT runtime·tstart_stdcall(SB),NOSPLIT,$0
 	// Switch from the host ABI to the Go ABI.
 	PUSH_REGS_HOST_TO_ABI0()
 
@@ -341,85 +385,16 @@ TEXT runtime·switchtothread(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	32(SP), SP
 	RET
 
-// See https://wrkhpi.wordpress.com/2007/08/09/getting-os-information-the-kuser_shared_data-structure/
-// Archived copy at:
-// http://web.archive.org/web/20210411000829/https://wrkhpi.wordpress.com/2007/08/09/getting-os-information-the-kuser_shared_data-structure/
-// Must read hi1, then lo, then hi2. The snapshot is valid if hi1 == hi2.
-#define _INTERRUPT_TIME 0x7ffe0008
-#define _SYSTEM_TIME 0x7ffe0014
-#define time_lo 0
-#define time_hi1 4
-#define time_hi2 8
-
 TEXT runtime·nanotime1(SB),NOSPLIT,$0-8
 	CMPB	runtime·useQPCTime(SB), $0
 	JNE	useQPC
 	MOVQ	$_INTERRUPT_TIME, DI
-loop:
-	MOVL	time_hi1(DI), AX
-	MOVL	time_lo(DI), BX
-	MOVL	time_hi2(DI), CX
-	CMPL	AX, CX
-	JNE	loop
-	SHLQ	$32, CX
-	ORQ	BX, CX
-	IMULQ	$100, CX
-	MOVQ	CX, ret+0(FP)
+	MOVQ	time_lo(DI), AX
+	IMULQ	$100, AX
+	MOVQ	AX, ret+0(FP)
 	RET
 useQPC:
-	// Call with ABIInternal because we could be
-	// very deep in a nosplit context and the wrapper
-	// adds stack space.
-	// TODO(#40724): The result from nanotimeQPC will
-	// be passed in a register, so store that to the
-	// stack so we can return through a wrapper.
-	JMP	runtime·nanotimeQPC<ABIInternal>(SB)
-	RET
-
-TEXT time·now(SB),NOSPLIT,$0-24
-	CMPB	runtime·useQPCTime(SB), $0
-	JNE	useQPC
-	MOVQ	$_INTERRUPT_TIME, DI
-loop:
-	MOVL	time_hi1(DI), AX
-	MOVL	time_lo(DI), BX
-	MOVL	time_hi2(DI), CX
-	CMPL	AX, CX
-	JNE	loop
-	SHLQ	$32, AX
-	ORQ	BX, AX
-	IMULQ	$100, AX
-	MOVQ	AX, mono+16(FP)
-
-	MOVQ	$_SYSTEM_TIME, DI
-wall:
-	MOVL	time_hi1(DI), AX
-	MOVL	time_lo(DI), BX
-	MOVL	time_hi2(DI), CX
-	CMPL	AX, CX
-	JNE	wall
-	SHLQ	$32, AX
-	ORQ	BX, AX
-	MOVQ	$116444736000000000, DI
-	SUBQ	DI, AX
-	IMULQ	$100, AX
-
-	// generated code for
-	//	func f(x uint64) (uint64, uint64) { return x/1000000000, x%100000000 }
-	// adapted to reduce duplication
-	MOVQ	AX, CX
-	MOVQ	$1360296554856532783, AX
-	MULQ	CX
-	ADDQ	CX, DX
-	RCRQ	$1, DX
-	SHRQ	$29, DX
-	MOVQ	DX, sec+0(FP)
-	IMULQ	$1000000000, DX
-	SUBQ	DX, CX
-	MOVL	CX, nsec+8(FP)
-	RET
-useQPC:
-	JMP	runtime·nowQPC(SB)
+	JMP	runtime·nanotimeQPC(SB)
 	RET
 
 // func osSetupTLS(mp *m)

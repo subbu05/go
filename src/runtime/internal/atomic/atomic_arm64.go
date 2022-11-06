@@ -3,11 +3,17 @@
 // license that can be found in the LICENSE file.
 
 //go:build arm64
-// +build arm64
 
 package atomic
 
-import "unsafe"
+import (
+	"internal/cpu"
+	"unsafe"
+)
+
+const (
+	offsetARM64HasATOMICS = unsafe.Offsetof(cpu.ARM64.HasATOMICS)
+)
 
 //go:noescape
 func Xadd(ptr *uint32, delta int32) uint32

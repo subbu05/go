@@ -6,11 +6,11 @@ package noder
 
 import (
 	"fmt"
+	"internal/buildcfg"
 	"strings"
 
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/syntax"
-	"cmd/internal/objabi"
 )
 
 func isSpace(c rune) bool {
@@ -30,13 +30,12 @@ const (
 		ir.NoCheckPtr |
 		ir.RegisterParams | // TODO(register args) remove after register abi is working
 		ir.CgoUnsafeArgs |
+		ir.UintptrKeepAlive |
 		ir.UintptrEscapes |
 		ir.Systemstack |
 		ir.Nowritebarrier |
 		ir.Nowritebarrierrec |
 		ir.Yeswritebarrierrec
-
-	typePragmas = ir.NotInHeap
 )
 
 func pragmaFlag(verb string) ir.PragmaFlag {
@@ -44,7 +43,7 @@ func pragmaFlag(verb string) ir.PragmaFlag {
 	case "go:build":
 		return ir.GoBuildPragma
 	case "go:nointerface":
-		if objabi.Experiment.FieldTrack {
+		if buildcfg.Experiment.FieldTrack {
 			return ir.Nointerface
 		}
 	case "go:noescape":
@@ -67,23 +66,15 @@ func pragmaFlag(verb string) ir.PragmaFlag {
 		return ir.Yeswritebarrierrec
 	case "go:cgo_unsafe_args":
 		return ir.CgoUnsafeArgs | ir.NoCheckPtr // implies NoCheckPtr (see #34968)
+	case "go:uintptrkeepalive":
+		return ir.UintptrKeepAlive
 	case "go:uintptrescapes":
-		// For the next function declared in the file
-		// any uintptr arguments may be pointer values
-		// converted to uintptr. This directive
-		// ensures that the referenced allocated
-		// object, if any, is retained and not moved
-		// until the call completes, even though from
-		// the types alone it would appear that the
-		// object is no longer needed during the
-		// call. The conversion to uintptr must appear
-		// in the argument list.
-		// Used in syscall/dll_windows.go.
-		return ir.UintptrEscapes
+		// This directive extends //go:uintptrkeepalive by forcing
+		// uintptr arguments to escape to the heap, which makes stack
+		// growth safe.
+		return ir.UintptrEscapes | ir.UintptrKeepAlive // implies UintptrKeepAlive
 	case "go:registerparams": // TODO(register args) remove after register abi is working
 		return ir.RegisterParams
-	case "go:notinheap":
-		return ir.NotInHeap
 	}
 	return 0
 }
@@ -110,7 +101,7 @@ func (p *noder) pragcgo(pos syntax.Pos, text string) {
 		case len(f) == 3 && !isQuoted(f[1]) && !isQuoted(f[2]):
 		case len(f) == 4 && !isQuoted(f[1]) && !isQuoted(f[2]) && isQuoted(f[3]):
 			f[3] = strings.Trim(f[3], `"`)
-			if objabi.GOOS == "aix" && f[3] != "" {
+			if buildcfg.GOOS == "aix" && f[3] != "" {
 				// On Aix, library pattern must be "lib.a/object.o"
 				// or "lib.a/libname.so.X"
 				n := strings.Split(f[3], "/")

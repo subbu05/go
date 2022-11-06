@@ -5,16 +5,15 @@
 package moddeps_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"internal/testenv"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -55,7 +54,7 @@ func TestAllDependencies(t *testing.T) {
 				// dependencies are vendored. If any imported package is missing,
 				// 'go list -deps' will fail when attempting to load it.
 				cmd := exec.Command(goBin, "list", "-mod=vendor", "-deps", "./...")
-				cmd.Env = append(os.Environ(), "GO111MODULE=on")
+				cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOWORK=off")
 				cmd.Dir = m.Dir
 				cmd.Stderr = new(strings.Builder)
 				_, err := cmd.Output()
@@ -68,8 +67,8 @@ func TestAllDependencies(t *testing.T) {
 
 			// There is no vendor directory, so the module must have no dependencies.
 			// Check that the list of active modules contains only the main module.
-			cmd := exec.Command(goBin, "list", "-mod=mod", "-m", "all")
-			cmd.Env = append(os.Environ(), "GO111MODULE=on")
+			cmd := exec.Command(goBin, "list", "-mod=readonly", "-m", "all")
+			cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOWORK=off")
 			cmd.Dir = m.Dir
 			cmd.Stderr = new(strings.Builder)
 			out, err := cmd.Output()
@@ -123,10 +122,38 @@ func TestAllDependencies(t *testing.T) {
 		t.Skip("skipping because a diff command with support for --recursive and --unified flags is unavailable")
 	}
 
+	// We're going to check the standard modules for tidiness, so we need a usable
+	// GOMODCACHE. If the default directory doesn't exist, use a temporary
+	// directory instead. (That can occur, for example, when running under
+	// run.bash with GO_TEST_SHORT=0: run.bash sets GOPATH=/nonexist-gopath, and
+	// GO_TEST_SHORT=0 causes it to run this portion of the test.)
+	var modcacheEnv []string
+	{
+		out, err := exec.Command(goBin, "env", "GOMODCACHE").Output()
+		if err != nil {
+			t.Fatalf("%s env GOMODCACHE: %v", goBin, err)
+		}
+		modcacheOk := false
+		if gomodcache := string(bytes.TrimSpace(out)); gomodcache != "" {
+			if _, err := os.Stat(gomodcache); err == nil {
+				modcacheOk = true
+			}
+		}
+		if !modcacheOk {
+			modcacheEnv = []string{
+				"GOMODCACHE=" + t.TempDir(),
+				"GOFLAGS=" + os.Getenv("GOFLAGS") + " -modcacherw", // Allow t.TempDir() to clean up subdirectories.
+			}
+		}
+	}
+
 	// Build the bundle binary at the golang.org/x/tools
 	// module version specified in GOROOT/src/cmd/go.mod.
 	bundleDir := t.TempDir()
-	r := runner{Dir: filepath.Join(runtime.GOROOT(), "src/cmd")}
+	r := runner{
+		Dir: filepath.Join(testenv.GOROOT(t), "src/cmd"),
+		Env: append(os.Environ(), modcacheEnv...),
+	}
 	r.run(t, goBin, "build", "-mod=readonly", "-o", bundleDir, "golang.org/x/tools/cmd/bundle")
 
 	var gorootCopyDir string
@@ -154,13 +181,13 @@ func TestAllDependencies(t *testing.T) {
 				}
 			}()
 
-			rel, err := filepath.Rel(runtime.GOROOT(), m.Dir)
+			rel, err := filepath.Rel(testenv.GOROOT(t), m.Dir)
 			if err != nil {
-				t.Fatalf("filepath.Rel(%q, %q): %v", runtime.GOROOT(), m.Dir, err)
+				t.Fatalf("filepath.Rel(%q, %q): %v", testenv.GOROOT(t), m.Dir, err)
 			}
 			r := runner{
 				Dir: filepath.Join(gorootCopyDir, rel),
-				Env: append(os.Environ(),
+				Env: append(append(os.Environ(), modcacheEnv...),
 					// Set GOROOT.
 					"GOROOT="+gorootCopyDir,
 					// Explicitly override PWD and clear GOROOT_FINAL so that GOROOT=gorootCopyDir is definitely used.
@@ -169,6 +196,7 @@ func TestAllDependencies(t *testing.T) {
 					// Add GOROOTcopy/bin and bundleDir to front of PATH.
 					"PATH="+filepath.Join(gorootCopyDir, "bin")+string(filepath.ListSeparator)+
 						bundleDir+string(filepath.ListSeparator)+os.Getenv("PATH"),
+					"GOWORK=off",
 				),
 			}
 			goBinCopy := filepath.Join(gorootCopyDir, "bin", "go")
@@ -223,23 +251,22 @@ func packagePattern(modulePath string) string {
 func makeGOROOTCopy(t *testing.T) string {
 	t.Helper()
 	gorootCopyDir := t.TempDir()
-	err := filepath.Walk(runtime.GOROOT(), func(src string, info os.FileInfo, err error) error {
+	err := filepath.Walk(testenv.GOROOT(t), func(src string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if src == filepath.Join(runtime.GOROOT(), ".git") {
+		if info.IsDir() && src == filepath.Join(testenv.GOROOT(t), ".git") {
 			return filepath.SkipDir
 		}
 
-		rel, err := filepath.Rel(runtime.GOROOT(), src)
+		rel, err := filepath.Rel(testenv.GOROOT(t), src)
 		if err != nil {
-			return fmt.Errorf("filepath.Rel(%q, %q): %v", runtime.GOROOT(), src, err)
+			return fmt.Errorf("filepath.Rel(%q, %q): %v", testenv.GOROOT(t), src, err)
 		}
 		dst := filepath.Join(gorootCopyDir, rel)
 
-		switch src {
-		case filepath.Join(runtime.GOROOT(), "bin"),
-			filepath.Join(runtime.GOROOT(), "pkg"):
+		if info.IsDir() && (src == filepath.Join(testenv.GOROOT(t), "bin") ||
+			src == filepath.Join(testenv.GOROOT(t), "pkg")) {
 			// If the OS supports symlinks, use them instead
 			// of copying the bin and pkg directories.
 			if err := os.Symlink(src, dst); err == nil {
@@ -333,7 +360,7 @@ func TestDependencyVersionsConsistent(t *testing.T) {
 		// It's ok if there are undetected differences in modules that do not
 		// provide imported packages: we will not have to pull in any backports of
 		// fixes to those modules anyway.
-		vendor, err := ioutil.ReadFile(filepath.Join(m.Dir, "vendor", "modules.txt"))
+		vendor, err := os.ReadFile(filepath.Join(m.Dir, "vendor", "modules.txt"))
 		if err != nil {
 			t.Error(err)
 			continue
@@ -407,19 +434,25 @@ func findGorootModules(t *testing.T) []gorootModule {
 	goBin := testenv.GoToolPath(t)
 
 	goroot.once.Do(func() {
-		goroot.err = filepath.WalkDir(runtime.GOROOT(), func(path string, info fs.DirEntry, err error) error {
+		goroot.err = filepath.WalkDir(testenv.GOROOT(t), func(path string, info fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if info.IsDir() && (info.Name() == "vendor" || info.Name() == "testdata") {
 				return filepath.SkipDir
 			}
-			if path == filepath.Join(runtime.GOROOT(), "pkg") {
+			if info.IsDir() && path == filepath.Join(testenv.GOROOT(t), "pkg") {
 				// GOROOT/pkg contains generated artifacts, not source code.
 				//
 				// In https://golang.org/issue/37929 it was observed to somehow contain
 				// a module cache, so it is important to skip. (That helps with the
 				// running time of this test anyway.)
+				return filepath.SkipDir
+			}
+			if info.IsDir() && (strings.HasPrefix(info.Name(), "_") || strings.HasPrefix(info.Name(), ".")) {
+				// _ and . prefixed directories can be used for internal modules
+				// without a vendor directory that don't contribute to the build
+				// but might be used for example as code generators.
 				return filepath.SkipDir
 			}
 			if info.IsDir() || info.Name() != "go.mod" {
@@ -430,7 +463,7 @@ func findGorootModules(t *testing.T) []gorootModule {
 			// Use 'go list' to describe the module contained in this directory (but
 			// not its dependencies).
 			cmd := exec.Command(goBin, "list", "-json", "-m")
-			cmd.Env = append(os.Environ(), "GO111MODULE=on")
+			cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOWORK=off")
 			cmd.Dir = dir
 			cmd.Stderr = new(strings.Builder)
 			out, err := cmd.Output()
@@ -451,8 +484,31 @@ func findGorootModules(t *testing.T) []gorootModule {
 			goroot.modules = append(goroot.modules, m)
 			return nil
 		})
-	})
+		if goroot.err != nil {
+			return
+		}
 
+		// knownGOROOTModules is a hard-coded list of modules that are known to exist in GOROOT.
+		// If findGorootModules doesn't find a module, it won't be covered by tests at all,
+		// so make sure at least these modules are found. See issue 46254. If this list
+		// becomes a nuisance to update, can be replaced with len(goroot.modules) check.
+		knownGOROOTModules := [...]string{
+			"std",
+			"cmd",
+			"misc",
+			"test/bench/go1",
+		}
+		var seen = make(map[string]bool) // Key is module path.
+		for _, m := range goroot.modules {
+			seen[m.Path] = true
+		}
+		for _, m := range knownGOROOTModules {
+			if !seen[m] {
+				goroot.err = fmt.Errorf("findGorootModules didn't find the well-known module %q", m)
+				break
+			}
+		}
+	})
 	if goroot.err != nil {
 		t.Fatal(goroot.err)
 	}
