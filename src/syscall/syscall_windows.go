@@ -103,8 +103,8 @@ func UTF16PtrFromString(s string) (*uint16, error) {
 
 // Errno is the Windows error number.
 //
-// Errno values can be tested against error values from the os package
-// using errors.Is. For example:
+// Errno values can be tested against error values using errors.Is.
+// For example:
 //
 //	_, _, err := syscall.Syscall(...)
 //	if errors.Is(err, fs.ErrNotExist) ...
@@ -142,20 +142,36 @@ func (e Errno) Error() string {
 	return string(utf16.Decode(b[:n]))
 }
 
-const _ERROR_BAD_NETPATH = Errno(53)
+const (
+	_ERROR_NOT_SUPPORTED        = Errno(50)
+	_ERROR_BAD_NETPATH          = Errno(53)
+	_ERROR_CALL_NOT_IMPLEMENTED = Errno(120)
+)
 
 func (e Errno) Is(target error) bool {
 	switch target {
 	case oserror.ErrPermission:
-		return e == ERROR_ACCESS_DENIED
+		return e == ERROR_ACCESS_DENIED ||
+			e == EACCES ||
+			e == EPERM
 	case oserror.ErrExist:
 		return e == ERROR_ALREADY_EXISTS ||
 			e == ERROR_DIR_NOT_EMPTY ||
-			e == ERROR_FILE_EXISTS
+			e == ERROR_FILE_EXISTS ||
+			e == EEXIST ||
+			e == ENOTEMPTY
 	case oserror.ErrNotExist:
 		return e == ERROR_FILE_NOT_FOUND ||
 			e == _ERROR_BAD_NETPATH ||
-			e == ERROR_PATH_NOT_FOUND
+			e == ERROR_PATH_NOT_FOUND ||
+			e == ENOENT
+	case errorspkg.ErrUnsupported:
+		return e == _ERROR_NOT_SUPPORTED ||
+			e == _ERROR_CALL_NOT_IMPLEMENTED ||
+			e == ENOSYS ||
+			e == ENOTSUP ||
+			e == EOPNOTSUPP ||
+			e == EWINDOWS
 	}
 	return false
 }
@@ -371,8 +387,11 @@ func Open(path string, mode int, perm uint32) (fd Handle, err error) {
 			}
 		}
 	}
-	h, e := CreateFile(pathp, access, sharemode, sa, createmode, attrs, 0)
-	return h, e
+	if createmode == OPEN_EXISTING && access == GENERIC_READ {
+		// Necessary for opening directory handles.
+		attrs |= FILE_FLAG_BACKUP_SEMANTICS
+	}
+	return CreateFile(pathp, access, sharemode, sa, createmode, attrs, 0)
 }
 
 func Read(fd Handle, p []byte) (n int, err error) {
@@ -837,8 +856,7 @@ func (rsa *RawSockaddrAny) Sockaddr() (Sockaddr, error) {
 		for n < len(pp.Path) && pp.Path[n] != 0 {
 			n++
 		}
-		bytes := (*[len(pp.Path)]byte)(unsafe.Pointer(&pp.Path[0]))[0:n:n]
-		sa.Name = string(bytes)
+		sa.Name = string(unsafe.Slice((*byte)(unsafe.Pointer(&pp.Path[0])), n))
 		return sa, nil
 
 	case AF_INET:

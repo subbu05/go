@@ -51,9 +51,18 @@ It is a comma-separated list of name=val pairs setting these named variables:
 	cgocheck: setting cgocheck=0 disables all checks for packages
 	using cgo to incorrectly pass Go pointers to non-Go code.
 	Setting cgocheck=1 (the default) enables relatively cheap
-	checks that may miss some errors.  Setting cgocheck=2 enables
-	expensive checks that should not miss any errors, but will
-	cause your program to run slower.
+	checks that may miss some errors. A more complete, but slow,
+	cgocheck mode can be enabled using GOEXPERIMENT (which
+	requires a rebuild), see https://pkg.go.dev/internal/goexperiment for details.
+
+	dontfreezetheworld: by default, the start of a fatal panic or throw
+	"freezes the world", stopping all goroutines, which makes it possible
+	to traceback all goroutines (running goroutines cannot be traced), and
+	keeps their state close to the point of panic. Setting
+	dontfreezetheworld=1 disables freeze, allowing goroutines to continue
+	executing during panic processing. This can be useful when debugging
+	the runtime scheduler, as freezetheworld perturbs scheduler state and
+	thus may hide problems.
 
 	efence: setting efence=1 causes the allocator to run in a mode
 	where each object is allocated on a unique page and addresses are
@@ -127,6 +136,13 @@ It is a comma-separated list of name=val pairs setting these named variables:
 	When set to 0 memory profiling is disabled.  Refer to the description of
 	MemProfileRate for the default value.
 
+	pagetrace: setting pagetrace=/path/to/file will write out a trace of page events
+	that can be viewed, analyzed, and visualized using the x/debug/cmd/pagetrace tool.
+	Build your program with GOEXPERIMENT=pagetrace to enable this functionality. Do not
+	enable this functionality if your program is a setuid binary as it introduces a security
+	risk in that scenario. Currently not supported on Windows, plan9 or js/wasm. Setting this
+	option for some applications can produce large traces, so use with care.
+
 	invalidptr: invalidptr=1 (the default) causes the garbage collector and stack
 	copier to crash the program if an invalid pointer value (for example, 1)
 	is found in a pointer-typed location. Setting invalidptr=0 disables this check.
@@ -162,6 +178,11 @@ It is a comma-separated list of name=val pairs setting these named variables:
 	report. This also extends the information returned by runtime.Stack. Ancestor's goroutine
 	IDs will refer to the ID of the goroutine at the time of creation; it's possible for this
 	ID to be reused for another goroutine. Setting N to 0 will report no ancestry information.
+
+	tracefpunwindoff: setting tracefpunwindoff=1 forces the execution tracer to
+	use the runtime's default stack unwinder instead of frame pointer unwinding.
+	This increases tracer overhead, but could be helpful as a workaround or for
+	debugging unexpected regressions caused by frame pointer unwinding.
 
 	asyncpreemptoff: asyncpreemptoff=1 disables signal-based
 	asynchronous goroutine preemption. This makes some loops

@@ -143,6 +143,9 @@ type Config struct {
 	// It is an error to set both FakeImportC and go115UsesCgo.
 	go115UsesCgo bool
 
+	// If _Trace is set, a debug trace is printed to stdout.
+	_Trace bool
+
 	// If Error != nil, it is called with each error found
 	// during type checking; err has dynamic type Error.
 	// Secondary errors (for instance, to enumerate all types
@@ -168,9 +171,12 @@ type Config struct {
 	// for unused imports.
 	DisableUnusedImportCheck bool
 
-	// If altComparableSemantics is set, ordinary (non-type parameter)
-	// interfaces satisfy the comparable constraint.
-	altComparableSemantics bool
+	// If _EnableReverseTypeInference is set, uninstantiated and
+	// partially instantiated generic functions may be assigned
+	// (incl. returned) to variables of function type and type
+	// inference will attempt to infer the missing type arguments.
+	// Experimental. Needs a proposal.
+	_EnableReverseTypeInference bool
 }
 
 func srcimporter_setUsesCgo(conf *Config) {
@@ -429,7 +435,7 @@ func AssertableTo(V *Interface, T Type) bool {
 	if T.Underlying() == Typ[Invalid] {
 		return false
 	}
-	return (*Checker)(nil).newAssertableTo(V, T)
+	return (*Checker)(nil).newAssertableTo(V, T, nil)
 }
 
 // AssignableTo reports whether a value of type V is assignable to a variable
@@ -470,14 +476,25 @@ func Implements(V Type, T *Interface) bool {
 	return (*Checker)(nil).implements(V, T, false, nil)
 }
 
+// Satisfies reports whether type V satisfies the constraint T.
+//
+// The behavior of Satisfies is unspecified if V is Typ[Invalid] or an uninstantiated
+// generic type.
+func Satisfies(V Type, T *Interface) bool {
+	return (*Checker)(nil).implements(V, T, true, nil)
+}
+
 // Identical reports whether x and y are identical types.
 // Receivers of Signature types are ignored.
 func Identical(x, y Type) bool {
-	return identical(x, y, true, nil)
+	var c comparer
+	return c.identical(x, y, nil)
 }
 
 // IdenticalIgnoreTags reports whether x and y are identical types if tags are ignored.
 // Receivers of Signature types are ignored.
 func IdenticalIgnoreTags(x, y Type) bool {
-	return identical(x, y, false, nil)
+	var c comparer
+	c.ignoreTags = true
+	return c.identical(x, y, nil)
 }

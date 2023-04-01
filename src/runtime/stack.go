@@ -98,6 +98,7 @@ const (
 	// The guard leaves enough room for one _StackSmall frame plus
 	// a _StackLimit chain of NOSPLIT calls plus _StackSystem
 	// bytes for the OS.
+	// This arithmetic must match that in cmd/internal/objabi/stack.go:StackLimit.
 	_StackGuard = 928*sys.StackGuardMultiplier + _StackSystem
 
 	// After a stack split check the SP is allowed to be this
@@ -107,6 +108,7 @@ const (
 
 	// The maximum number of bytes that a chain of NOSPLIT
 	// functions can use.
+	// This arithmetic must match that in cmd/internal/objabi/stack.go:StackLimit.
 	_StackLimit = _StackGuard - _StackSystem - _StackSmall
 )
 
@@ -564,7 +566,7 @@ type adjustinfo struct {
 	sghi uintptr
 }
 
-// Adjustpointer checks whether *vpp is in the old stack described by adjinfo.
+// adjustpointer checks whether *vpp is in the old stack described by adjinfo.
 // If so, it rewrites *vpp to point into the new stack.
 func adjustpointer(adjinfo *adjustinfo, vpp unsafe.Pointer) {
 	pp := (*uintptr)(vpp)
@@ -647,11 +649,10 @@ func adjustpointers(scanp unsafe.Pointer, bv *bitvector, adjinfo *adjustinfo, f 
 }
 
 // Note: the argument/return area is adjusted by the callee.
-func adjustframe(frame *stkframe, arg unsafe.Pointer) bool {
-	adjinfo := (*adjustinfo)(arg)
+func adjustframe(frame *stkframe, adjinfo *adjustinfo) {
 	if frame.continpc == 0 {
 		// Frame is dead.
-		return true
+		return
 	}
 	f := frame.fn
 	if stackDebug >= 2 {
@@ -661,7 +662,7 @@ func adjustframe(frame *stkframe, arg unsafe.Pointer) bool {
 		// A special routine at the bottom of stack of a goroutine that does a systemstack call.
 		// We will allow it to be copied even though we don't
 		// have full GC info for it (because it is written in asm).
-		return true
+		return
 	}
 
 	locals, args, objs := frame.getStackMap(&adjinfo.cache, true)
@@ -734,8 +735,6 @@ func adjustframe(frame *stkframe, arg unsafe.Pointer) bool {
 			}
 		}
 	}
-
-	return true
 }
 
 func adjustctxt(gp *g, adjinfo *adjustinfo) {
@@ -929,7 +928,10 @@ func copystack(gp *g, newsize uintptr) {
 	gp.stktopsp += adjinfo.delta
 
 	// Adjust pointers in the new stack.
-	gentraceback(^uintptr(0), ^uintptr(0), 0, gp, 0, nil, 0x7fffffff, adjustframe, noescape(unsafe.Pointer(&adjinfo)), 0)
+	var u unwinder
+	for u.init(gp, 0); u.valid(); u.next() {
+		adjustframe(&u.frame, &adjinfo)
+	}
 
 	// free old stack
 	if stackPoisonCopy != 0 {

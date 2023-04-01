@@ -412,18 +412,18 @@ func canMergeLoad(target, load *Value) bool {
 	return true
 }
 
-// isSameCall reports whether sym is the same as the given named symbol
+// isSameCall reports whether sym is the same as the given named symbol.
 func isSameCall(sym interface{}, name string) bool {
 	fn := sym.(*AuxCall).Fn
 	return fn != nil && fn.String() == name
 }
 
-// canLoadUnaligned reports if the architecture supports unaligned load operations
+// canLoadUnaligned reports if the architecture supports unaligned load operations.
 func canLoadUnaligned(c *Config) bool {
 	return c.ctxt.Arch.Alignment == 1
 }
 
-// nlz returns the number of leading zeros.
+// nlzX returns the number of leading zeros.
 func nlz64(x int64) int { return bits.LeadingZeros64(uint64(x)) }
 func nlz32(x int32) int { return bits.LeadingZeros32(uint32(x)) }
 func nlz16(x int16) int { return bits.LeadingZeros16(uint16(x)) }
@@ -467,7 +467,7 @@ func log2uint32(n int64) int64 {
 	return int64(bits.Len32(uint32(n))) - 1
 }
 
-// isPowerOfTwo functions report whether n is a power of 2.
+// isPowerOfTwoX functions report whether n is a power of 2.
 func isPowerOfTwo8(n int8) bool {
 	return n > 0 && n&(n-1) == 0
 }
@@ -729,6 +729,13 @@ type Aux interface {
 	CanBeAnSSAAux()
 }
 
+// for now only used to mark moves that need to avoid clobbering flags
+type auxMark bool
+
+func (auxMark) CanBeAnSSAAux() {}
+
+var AuxMark auxMark
+
 // stringAux wraps string values for use in Aux.
 type stringAux string
 
@@ -797,7 +804,7 @@ func loadLSymOffset(lsym *obj.LSym, offset int64) *obj.LSym {
 }
 
 // de-virtualize an InterLECall
-// 'sym' is the symbol for the itab
+// 'sym' is the symbol for the itab.
 func devirtLESym(v *Value, aux Aux, sym Sym, offset int64) *obj.LSym {
 	n, ok := sym.(*obj.LSym)
 	if !ok {
@@ -839,9 +846,7 @@ func isSamePtr(p1, p2 *Value) bool {
 	case OpOffPtr:
 		return p1.AuxInt == p2.AuxInt && isSamePtr(p1.Args[0], p2.Args[0])
 	case OpAddr, OpLocalAddr:
-		// OpAddr's 0th arg is either OpSP or OpSB, which means that it is uniquely identified by its Op.
-		// Checking for value equality only works after [z]cse has run.
-		return p1.Aux == p2.Aux && p1.Args[0].Op == p2.Args[0].Op
+		return p1.Aux == p2.Aux
 	case OpAddPtr:
 		return p1.Args[1] == p2.Args[1] && isSamePtr(p1.Args[0], p2.Args[0])
 	}
@@ -898,7 +903,7 @@ func disjoint(p1 *Value, n1 int64, p2 *Value, n2 int64) bool {
 	return false
 }
 
-// moveSize returns the number of bytes an aligned MOV instruction moves
+// moveSize returns the number of bytes an aligned MOV instruction moves.
 func moveSize(align int64, c *Config) int64 {
 	switch {
 	case align%8 == 0 && c.PtrSize == 8:
@@ -1019,7 +1024,7 @@ func warnRule(cond bool, v *Value, s string) bool {
 	return true
 }
 
-// for a pseudo-op like (LessThan x), extract x
+// for a pseudo-op like (LessThan x), extract x.
 func flagArg(v *Value) *Value {
 	if len(v.Args) != 1 || !v.Args[0].Type.IsFlags() {
 		return nil
@@ -1250,7 +1255,7 @@ func reciprocalExact32(c float32) bool {
 	}
 }
 
-// check if an immediate can be directly encoded into an ARM's instruction
+// check if an immediate can be directly encoded into an ARM's instruction.
 func isARMImmRot(v uint32) bool {
 	for i := 0; i < 16; i++ {
 		if v&^0xff == 0 {
@@ -1293,6 +1298,10 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 		OpAMD64SHRL, OpAMD64SHRLconst, OpAMD64SARL, OpAMD64SARLconst,
 		OpAMD64SHLL, OpAMD64SHLLconst:
 		return true
+	case OpARM64REV16W, OpARM64REVW, OpARM64RBITW, OpARM64CLZW, OpARM64EXTRWconst,
+		OpARM64MULW, OpARM64MNEGW, OpARM64UDIVW, OpARM64DIVW, OpARM64UMODW,
+		OpARM64MADDW, OpARM64MSUBW, OpARM64RORW, OpARM64RORWconst:
+		return true
 	case OpArg:
 		return x.Type.Size() == 4
 	case OpPhi, OpSelect0, OpSelect1:
@@ -1312,7 +1321,7 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper48Bits is similar to zeroUpper32Bits, but for upper 48 bits
+// zeroUpper48Bits is similar to zeroUpper32Bits, but for upper 48 bits.
 func zeroUpper48Bits(x *Value, depth int) bool {
 	switch x.Op {
 	case OpAMD64MOVWQZX, OpAMD64MOVWload, OpAMD64MOVWloadidx1, OpAMD64MOVWloadidx2:
@@ -1336,7 +1345,7 @@ func zeroUpper48Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper56Bits is similar to zeroUpper32Bits, but for upper 56 bits
+// zeroUpper56Bits is similar to zeroUpper32Bits, but for upper 56 bits.
 func zeroUpper56Bits(x *Value, depth int) bool {
 	switch x.Op {
 	case OpAMD64MOVBQZX, OpAMD64MOVBload, OpAMD64MOVBloadidx1:
@@ -1356,6 +1365,21 @@ func zeroUpper56Bits(x *Value, depth int) bool {
 		}
 		return true
 
+	}
+	return false
+}
+
+func isInlinableMemclr(c *Config, sz int64) bool {
+	if sz < 0 {
+		return false
+	}
+	// TODO: expand this check to allow other architectures
+	// see CL 454255 and issue 56997
+	switch c.arch {
+	case "amd64", "arm64":
+		return true
+	case "ppc64le", "ppc64":
+		return sz < 512
 	}
 	return false
 }
@@ -1486,7 +1510,7 @@ func encodePPC64RotateMask(rotate, mask, nbits int64) int64 {
 	return int64(me) | int64(mb<<8) | int64(rotate<<16) | int64(nbits<<24)
 }
 
-// The inverse operation of encodePPC64RotateMask.  The values returned as
+// DecodePPC64RotateMask is the inverse operation of encodePPC64RotateMask.  The values returned as
 // mb and me satisfy the POWER ISA definition of MASK(x,y) where MASK(mb,me) = mask.
 func DecodePPC64RotateMask(sauxint int64) (rotate, mb, me int64, mask uint64) {
 	auxint := uint64(sauxint)
@@ -1625,7 +1649,7 @@ func isARM64BFMask(lsb, mask, rshift int64) bool {
 	return shiftedMask != 0 && isPowerOfTwo64(shiftedMask+1) && nto(shiftedMask)+lsb < 64
 }
 
-// returns the bitfield width of mask >> rshift for arm64 bitfield ops
+// returns the bitfield width of mask >> rshift for arm64 bitfield ops.
 func arm64BFWidth(mask, rshift int64) int64 {
 	shiftedMask := int64(uint64(mask) >> uint64(rshift))
 	if shiftedMask == 0 {

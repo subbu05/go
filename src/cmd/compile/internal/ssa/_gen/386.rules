@@ -56,8 +56,12 @@
 (Sqrt ...) => (SQRTSD ...)
 (Sqrt32 ...) => (SQRTSS ...)
 
+(Ctz8 x) => (BSFL (ORLconst <typ.UInt32> [0x100] x))
+(Ctz8NonZero ...) => (BSFL ...)
 (Ctz16 x) => (BSFL (ORLconst <typ.UInt32> [0x10000] x))
 (Ctz16NonZero ...) => (BSFL ...)
+(Ctz32 ...) => (LoweredCtz32 ...)
+(Ctz32NonZero ...) => (BSFL ...)
 
 // Lowering extension
 (SignExt8to16  ...) => (MOVBLSX ...)
@@ -333,7 +337,8 @@
 (GetCallerPC ...) => (LoweredGetCallerPC ...)
 (GetCallerSP ...) => (LoweredGetCallerSP ...)
 (Addr {sym} base) => (LEAL {sym} base)
-(LocalAddr {sym} base _) => (LEAL {sym} base)
+(LocalAddr <t> {sym} base mem) && t.Elem().HasPointers() => (LEAL {sym} (SPanchored base mem))
+(LocalAddr <t> {sym} base _)  && !t.Elem().HasPointers() => (LEAL {sym} base)
 
 // block rewrites
 (If (SETL  cmp) yes no) => (LT  cmp yes no)
@@ -393,7 +398,7 @@
 (NE (TESTB (SETNEF cmp) (SETNEF cmp)) yes no) => (NEF  cmp yes no)
 
 // fold constants into instructions
-(ADDL x (MOVLconst [c])) => (ADDLconst [c] x)
+(ADDL x (MOVLconst <t> [c])) && !t.IsPtr() => (ADDLconst [c] x)
 (ADDLcarry x (MOVLconst [c])) => (ADDLconstcarry [c] x)
 (ADCL x (MOVLconst [c]) f) => (ADCLconst [c] x f)
 

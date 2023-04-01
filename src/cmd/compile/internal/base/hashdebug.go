@@ -5,10 +5,14 @@
 package base
 
 import (
+	"bytes"
 	"cmd/internal/notsha256"
+	"cmd/internal/obj"
+	"cmd/internal/src"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,18 +31,42 @@ type hashAndMask struct {
 }
 
 type HashDebug struct {
-	mu   sync.Mutex
-	name string // base name of the flag/variable.
+	mu   sync.Mutex // for logfile, posTmp, bytesTmp
+	name string     // base name of the flag/variable.
 	// what file (if any) receives the yes/no logging?
 	// default is os.Stdout
-	logfile writeSyncer
-	matches []hashAndMask // A hash matches if one of these matches.
-	yes, no bool
+	logfile          writeSyncer
+	posTmp           []src.Pos
+	bytesTmp         bytes.Buffer
+	matches          []hashAndMask // A hash matches if one of these matches.
+	yes, no          bool
+	fileSuffixOnly   bool // for Pos hashes, remove the directory prefix.
+	inlineSuffixOnly bool // for Pos hashes, remove all but the most inline position.
+}
+
+// SetFileSuffixOnly controls whether hashing and reporting use the entire
+// file path name, just the basename.  This makes hashing more consistent,
+// at the expense of being able to certainly locate the file.
+func (d *HashDebug) SetFileSuffixOnly(b bool) *HashDebug {
+	d.fileSuffixOnly = b
+	return d
+}
+
+// SetInlineSuffixOnly controls whether hashing and reporting use the entire
+// inline position, or just the most-inline suffix.  Compiler debugging tends
+// to want the whole inlining, debugging user problems (loopvarhash, e.g.)
+// typically does not need to see the entire inline tree, there is just one
+// copy of the source code.
+func (d *HashDebug) SetInlineSuffixOnly(b bool) *HashDebug {
+	d.inlineSuffixOnly = b
+	return d
 }
 
 // The default compiler-debugging HashDebug, for "-d=gossahash=..."
 var hashDebug *HashDebug
-var FmaHash *HashDebug
+
+var FmaHash *HashDebug     // for debugging fused-multiply-add floating point changes
+var LoopVarHash *HashDebug // for debugging shared/private loop variable changes
 
 // DebugHashMatch reports whether debug variable Gossahash
 //
@@ -51,10 +79,10 @@ var FmaHash *HashDebug
 //  4. is a suffix of the sha1 hash of pkgAndName (returns true)
 //
 //  5. OR
-//     if the value is in the regular language "[01]+(;[01]+)+"
+//     if the value is in the regular language "[01]+(/[01]+)+"
 //     test the [01]+ substrings after in order returning true
 //     for the first one that suffix-matches. The substrings AFTER
-//     the first semicolon are numbered 0,1, etc and are named
+//     the first slash are numbered 0,1, etc and are named
 //     fmt.Sprintf("%s%d", varname, number)
 //     Clause 5 is not really intended for human use and only
 //     matters for failures that require multiple triggers.
@@ -152,7 +180,11 @@ func NewHashDebug(ev, s string, file writeSyncer) *HashDebug {
 }
 
 func hashOf(pkgAndName string, param uint64) uint64 {
-	hbytes := notsha256.Sum256([]byte(pkgAndName))
+	return hashOfBytes([]byte(pkgAndName), param)
+}
+
+func hashOfBytes(sbytes []byte, param uint64) uint64 {
+	hbytes := notsha256.Sum256(sbytes)
 	hash := uint64(hbytes[7])<<56 + uint64(hbytes[6])<<48 +
 		uint64(hbytes[5])<<40 + uint64(hbytes[4])<<32 +
 		uint64(hbytes[3])<<24 + uint64(hbytes[2])<<16 +
@@ -196,6 +228,7 @@ func (d *HashDebug) DebugHashMatchParam(pkgAndName string, param uint64) bool {
 	if d.no {
 		return false
 	}
+
 	if d.yes {
 		d.logDebugHashMatch(d.name, pkgAndName, "y", param)
 		return true
@@ -220,9 +253,86 @@ func (d *HashDebug) DebugHashMatchParam(pkgAndName string, param uint64) bool {
 	return false
 }
 
+// DebugHashMatchPos is similar to DebugHashMatchParam, but for hash computation
+// it uses the source position including all inlining information instead of
+// package name and path. The output trigger string is prefixed with "POS=" so
+// that tools processing the output can reliably tell the difference. The mutex
+// locking is also more frequent and more granular.
+// Note that the default answer for no environment variable (d == nil)
+// is "yes", do the thing.
+func (d *HashDebug) DebugHashMatchPos(ctxt *obj.Link, pos src.XPos) bool {
+	if d == nil {
+		return true
+	}
+	if d.no {
+		return false
+	}
+	// Written this way to make inlining likely.
+	return d.debugHashMatchPos(ctxt, pos)
+}
+
+func (d *HashDebug) debugHashMatchPos(ctxt *obj.Link, pos src.XPos) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.bytesForPos(ctxt, pos)
+
+	if d.yes {
+		d.logDebugHashMatchLocked(d.name, string(b), "y", 0)
+		return true
+	}
+
+	hash := hashOfBytes(b, 0)
+
+	for _, m := range d.matches {
+		if (m.hash^hash)&m.mask == 0 {
+			hstr := ""
+			if hash == 0 {
+				hstr = "0"
+			} else {
+				for ; hash != 0; hash = hash >> 1 {
+					hstr = string('0'+byte(hash&1)) + hstr
+				}
+			}
+			d.logDebugHashMatchLocked(m.name, "POS="+string(b), hstr, 0)
+			return true
+		}
+	}
+	return false
+}
+
+// bytesForPos renders a position, including inlining, into d.bytesTmp
+// and returns the byte array.  d.mu must be locked.
+func (d *HashDebug) bytesForPos(ctxt *obj.Link, pos src.XPos) []byte {
+	d.posTmp = ctxt.AllPos(pos, d.posTmp)
+	// Reverse posTmp to put outermost first.
+	b := &d.bytesTmp
+	b.Reset()
+	start := len(d.posTmp) - 1
+	if d.inlineSuffixOnly {
+		start = 0
+	}
+	for i := start; i >= 0; i-- {
+		p := &d.posTmp[i]
+		f := p.Filename()
+		if d.fileSuffixOnly {
+			f = filepath.Base(f)
+		}
+		fmt.Fprintf(b, "%s:%d:%d", f, p.Line(), p.Col())
+		if i != 0 {
+			b.WriteByte(';')
+		}
+	}
+	return b.Bytes()
+}
+
 func (d *HashDebug) logDebugHashMatch(varname, name, hstr string, param uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.logDebugHashMatchLocked(varname, name, hstr, param)
+}
+
+func (d *HashDebug) logDebugHashMatchLocked(varname, name, hstr string, param uint64) {
 	file := d.logfile
 	if file == nil {
 		if tmpfile := os.Getenv("GSHS_LOGFILE"); tmpfile != "" {

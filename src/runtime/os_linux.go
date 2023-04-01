@@ -176,12 +176,20 @@ func newosproc(mp *m) {
 	// with signals disabled. It will enable them in minit.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(abi.FuncPCABI0(mstart)))
+	ret := retryOnEAGAIN(func() int32 {
+		r := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(abi.FuncPCABI0(mstart)))
+		// clone returns positive TID, negative errno.
+		// We don't care about the TID.
+		if r >= 0 {
+			return 0
+		}
+		return -r
+	})
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 
-	if ret < 0 {
-		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", -ret, ")\n")
-		if ret == -_EAGAIN {
+	if ret != 0 {
+		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", ret, ")\n")
+		if ret == _EAGAIN {
 			println("runtime: may need to increase max user processes (ulimit -u)")
 		}
 		throw("newosproc")
@@ -194,18 +202,15 @@ func newosproc(mp *m) {
 func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
 	stack := sysAlloc(stacksize, &memstats.stacks_sys)
 	if stack == nil {
-		write(2, unsafe.Pointer(&failallocatestack[0]), int32(len(failallocatestack)))
+		writeErrStr(failallocatestack)
 		exit(1)
 	}
 	ret := clone(cloneFlags, unsafe.Pointer(uintptr(stack)+stacksize), nil, nil, fn)
 	if ret < 0 {
-		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		writeErrStr(failthreadcreate)
 		exit(1)
 	}
 }
-
-var failallocatestack = []byte("runtime: failed to allocate stack for the new OS thread\n")
-var failthreadcreate = []byte("runtime: failed to create new OS thread\n")
 
 const (
 	_AT_NULL   = 0  // End of vector
@@ -221,6 +226,8 @@ var addrspace_vec [1]byte
 
 func mincore(addr unsafe.Pointer, n uintptr, dst *byte) int32
 
+var auxvreadbuf [128]uintptr
+
 func sysargs(argc int32, argv **byte) {
 	n := argc + 1
 
@@ -233,8 +240,10 @@ func sysargs(argc int32, argv **byte) {
 	n++
 
 	// now argv+n is auxv
-	auxv := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
-	if sysauxv(auxv[:]) != 0 {
+	auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
+
+	if pairs := sysauxv(auxvp[:]); pairs != 0 {
+		auxv = auxvp[: pairs*2 : pairs*2]
 		return
 	}
 	// In some situations we don't get a loader-provided
@@ -264,23 +273,24 @@ func sysargs(argc int32, argv **byte) {
 		munmap(p, size)
 		return
 	}
-	var buf [128]uintptr
-	n = read(fd, noescape(unsafe.Pointer(&buf[0])), int32(unsafe.Sizeof(buf)))
+
+	n = read(fd, noescape(unsafe.Pointer(&auxvreadbuf[0])), int32(unsafe.Sizeof(auxvreadbuf)))
 	closefd(fd)
 	if n < 0 {
 		return
 	}
 	// Make sure buf is terminated, even if we didn't read
 	// the whole file.
-	buf[len(buf)-2] = _AT_NULL
-	sysauxv(buf[:])
+	auxvreadbuf[len(auxvreadbuf)-2] = _AT_NULL
+	pairs := sysauxv(auxvreadbuf[:])
+	auxv = auxvreadbuf[: pairs*2 : pairs*2]
 }
 
 // startupRandomData holds random bytes initialized at startup. These come from
 // the ELF AT_RANDOM auxiliary vector.
 var startupRandomData []byte
 
-func sysauxv(auxv []uintptr) int {
+func sysauxv(auxv []uintptr) (pairs int) {
 	var i int
 	for ; auxv[i] != _AT_NULL; i += 2 {
 		tag, val := auxv[i], auxv[i+1]
@@ -414,7 +424,7 @@ func mdestroy(mp *m) {
 //#define sa_handler k_sa_handler
 //#endif
 
-func sigreturn()
+func sigreturn__sigaction()
 func sigtramp() // Called via C ABI
 func cgoSigtramp()
 
@@ -471,7 +481,7 @@ func setsig(i uint32, fn uintptr) {
 	// should not be used". x86_64 kernel requires it. Only use it on
 	// x86.
 	if GOARCH == "386" || GOARCH == "amd64" {
-		sa.sa_restorer = abi.FuncPCABI0(sigreturn)
+		sa.sa_restorer = abi.FuncPCABI0(sigreturn__sigaction)
 	}
 	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
 		if iscgo {
@@ -553,9 +563,6 @@ func signalM(mp *m, sig int) {
 	tgkill(getpid(), int(mp.procid), sig)
 }
 
-// go118UseTimerCreateProfiler enables the per-thread CPU profiler.
-const go118UseTimerCreateProfiler = true
-
 // validSIGPROF compares this signal delivery's code against the signal sources
 // that the profiler uses, returning whether the delivery should be processed.
 // To be processed, a signal delivery from a known profiling mechanism should
@@ -613,10 +620,6 @@ func setProcessCPUProfiler(hz int32) {
 func setThreadCPUProfiler(hz int32) {
 	mp := getg().m
 	mp.profilehz = hz
-
-	if !go118UseTimerCreateProfiler {
-		return
-	}
 
 	// destroy any active timer
 	if mp.profileTimerValid.Load() {

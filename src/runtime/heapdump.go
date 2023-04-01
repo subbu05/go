@@ -120,7 +120,7 @@ type typeCacheBucket struct {
 
 var typecache [typeCacheBuckets]typeCacheBucket
 
-// dump a uint64 in a varint format parseable by encoding/binary
+// dump a uint64 in a varint format parseable by encoding/binary.
 func dumpint(v uint64) {
 	var buf [10]byte
 	var n int
@@ -142,7 +142,7 @@ func dumpbool(b bool) {
 	}
 }
 
-// dump varint uint64 length followed by memory contents
+// dump varint uint64 length followed by memory contents.
 func dumpmemrange(data unsafe.Pointer, len uintptr) {
 	dumpint(uint64(len))
 	dwrite(data, len)
@@ -159,7 +159,7 @@ func dumpstr(s string) {
 	dumpmemrange(unsafe.Pointer(unsafe.StringData(s)), uintptr(len(s)))
 }
 
-// dump information for a type
+// dump information for a type.
 func dumptype(t *_type) {
 	if t == nil {
 		return
@@ -206,7 +206,7 @@ func dumptype(t *_type) {
 	dumpbool(t.kind&kindDirectIface == 0 || t.ptrdata != 0)
 }
 
-// dump an object
+// dump an object.
 func dumpobj(obj unsafe.Pointer, size uintptr, bv bitvector) {
 	dumpint(tagObject)
 	dumpint(uint64(uintptr(obj)))
@@ -239,7 +239,7 @@ type childInfo struct {
 	depth  uintptr   // depth in call stack (0 == most recent)
 }
 
-// dump kinds & offsets of interesting fields in bv
+// dump kinds & offsets of interesting fields in bv.
 func dumpbv(cbv *bitvector, offset uintptr) {
 	for i := uintptr(0); i < uintptr(cbv.n); i++ {
 		if cbv.ptrbit(i) == 1 {
@@ -249,8 +249,7 @@ func dumpbv(cbv *bitvector, offset uintptr) {
 	}
 }
 
-func dumpframe(s *stkframe, arg unsafe.Pointer) bool {
-	child := (*childInfo)(arg)
+func dumpframe(s *stkframe, child *childInfo) {
 	f := s.fn
 
 	// Figure out what we can about our stack map
@@ -333,7 +332,7 @@ func dumpframe(s *stkframe, arg unsafe.Pointer) bool {
 	} else {
 		child.args.n = -1
 	}
-	return true
+	return
 }
 
 func dumpgoroutine(gp *g) {
@@ -369,7 +368,10 @@ func dumpgoroutine(gp *g) {
 	child.arglen = 0
 	child.sp = nil
 	child.depth = 0
-	gentraceback(pc, sp, lr, gp, 0, nil, 0x7fffffff, dumpframe, noescape(unsafe.Pointer(&child)), 0)
+	var u unwinder
+	for u.initAt(pc, sp, lr, gp, 0); u.valid(); u.next() {
+		dumpframe(&u.frame, &child)
+	}
 
 	// dump defer & panic records
 	for d := gp._defer; d != nil; d = d.link {

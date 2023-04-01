@@ -45,7 +45,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 	switch id {
 	default:
 		// make argument getter
-		xlist, _ := check.exprList(call.ArgList, false)
+		xlist := check.exprList(call.ArgList)
 		arg = func(x *operand, i int) { *x = *xlist[i] }
 		nargs = len(xlist)
 		// evaluate first argument, if present
@@ -231,6 +231,29 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		x.mode = mode
 		x.typ = Typ[Int]
 		x.val = val
+
+	case _Clear:
+		// clear(m)
+		if !check.allowVersion(check.pkg, 1, 21) {
+			check.versionErrorf(call.Fun, "go1.21", "clear")
+			return
+		}
+
+		if !underIs(x.typ, func(u Type) bool {
+			switch u.(type) {
+			case *Map, *Slice:
+				return true
+			}
+			check.errorf(x, InvalidClear, invalidArg+"cannot clear %s: argument must be (or constrained by) map or slice", x)
+			return false
+		}) {
+			return
+		}
+
+		x.mode = novalue
+		if check.recordTypes() {
+			check.recordBuiltinType(call.Fun, makeSig(nil, x.typ))
+		}
 
 	case _Close:
 		// close(c)
@@ -655,7 +678,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 			return
 		}
 
-		check.expr(x, selx.X)
+		check.expr(nil, x, selx.X)
 		if x.mode == invalid {
 			return
 		}
@@ -683,7 +706,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		// TODO(gri) Should we pass x.typ instead of base (and have indirect report if derefStructPtr indirected)?
 		check.recordSelection(selx, FieldVal, base, obj, index, false)
 
-		// record the selector expression (was bug - issue #47895)
+		// record the selector expression (was bug - go.dev/issue/47895)
 		{
 			mode := value
 			if x.mode == variable || indirect {
@@ -702,8 +725,13 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 				check.recordBuiltinType(call.Fun, makeSig(Typ[Uintptr], obj.Type()))
 			}
 		} else {
+			offs := check.conf.offsetof(base, index)
+			if offs < 0 {
+				check.errorf(x, TypeTooLarge, "%s is too large", x)
+				return
+			}
 			x.mode = constant_
-			x.val = constant.MakeInt64(check.conf.offsetof(base, index))
+			x.val = constant.MakeInt64(offs)
 			// result is constant - no need to record signature
 		}
 		x.typ = Typ[Uintptr]
@@ -721,8 +749,13 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 				check.recordBuiltinType(call.Fun, makeSig(Typ[Uintptr], x.typ))
 			}
 		} else {
+			size := check.conf.sizeof(x.typ)
+			if size < 0 {
+				check.errorf(x, TypeTooLarge, "%s is too large", x)
+				return
+			}
 			x.mode = constant_
-			x.val = constant.MakeInt64(check.conf.sizeof(x.typ))
+			x.val = constant.MakeInt64(size)
 			// result is constant - no need to record signature
 		}
 		x.typ = Typ[Uintptr]
@@ -845,7 +878,7 @@ func (check *Checker) builtin(x *operand, call *syntax.CallExpr, id builtinId) (
 		var t operand
 		x1 := x
 		for _, arg := range call.ArgList {
-			check.rawExpr(x1, arg, nil, false) // permit trace for types, e.g.: new(trace(T))
+			check.rawExpr(nil, x1, arg, nil, false) // permit trace for types, e.g.: new(trace(T))
 			check.dump("%v: %s", posFor(x1), x1)
 			x1 = &t // use incoming x only for first argument
 		}
@@ -935,7 +968,7 @@ func (check *Checker) applyTypeFunc(f func(Type) Type, x *operand, id builtinId)
 		default:
 			unreachable()
 		}
-		check.softErrorf(x, code, "%s not supported as argument to %s for go1.18 (see issue #50937)", x, predeclaredFuncs[id].name)
+		check.softErrorf(x, code, "%s not supported as argument to %s for go1.18 (see go.dev/issue/50937)", x, predeclaredFuncs[id].name)
 
 		// Construct a suitable new type parameter for the result type.
 		// The type parameter is placed in the current package so export/import

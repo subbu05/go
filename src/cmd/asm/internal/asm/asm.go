@@ -297,7 +297,7 @@ func (p *Parser) asmGlobl(operands [][]lex.Token) {
 	}
 
 	// log.Printf("GLOBL %s %d, $%d", name, flag, size)
-	p.ctxt.Globl(nameAddr.Sym, addr.Offset, int(flag))
+	p.ctxt.GloblPos(nameAddr.Sym, addr.Offset, int(flag), p.pos())
 }
 
 // asmPCData assembles a PCDATA pseudo-op.
@@ -640,6 +640,18 @@ func (p *Parser) asmInstruction(op obj.As, cond string, a []obj.Addr) {
 			if arch.IsLoong64CMP(op) {
 				prog.From = a[0]
 				prog.Reg = p.getRegister(prog, op, &a[1])
+				break
+			}
+
+			if arch.IsLoong64RDTIME(op) {
+				// The Loong64 RDTIME family of instructions is a bit special,
+				// in that both its register operands are outputs
+				prog.To = a[0]
+				if a[1].Type != obj.TYPE_REG {
+					p.errorf("invalid addressing modes for 2nd operand to %s instruction, must be register", op)
+					return
+				}
+				prog.RegTo2 = a[1].Reg
 				break
 			}
 		}

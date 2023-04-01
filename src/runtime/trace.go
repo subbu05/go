@@ -66,11 +66,11 @@ const (
 	traceEvGoBlockGC         = 42 // goroutine blocks on GC assist [timestamp, stack]
 	traceEvGCMarkAssistStart = 43 // GC mark assist start [timestamp, stack]
 	traceEvGCMarkAssistDone  = 44 // GC mark assist done [timestamp]
-	traceEvUserTaskCreate    = 45 // trace.NewContext [timestamp, internal task id, internal parent task id, stack, name string]
+	traceEvUserTaskCreate    = 45 // trace.NewTask [timestamp, internal task id, internal parent task id, name string, stack]
 	traceEvUserTaskEnd       = 46 // end of a task [timestamp, internal task id, stack]
-	traceEvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), stack, name string]
+	traceEvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), name string, stack]
 	traceEvUserLog           = 48 // trace.Log [timestamp, internal task id, key string id, stack, value string]
-	traceEvCPUSample         = 49 // CPU profiling sample [timestamp, stack, real timestamp, real P id (-1 when absent), goroutine id]
+	traceEvCPUSample         = 49 // CPU profiling sample [timestamp, real timestamp, real P id (-1 when absent), goroutine id, stack]
 	traceEvCount             = 50
 	// Byte is used but only 6 bits are available for event type.
 	// The remaining 2 bits are used to specify the number of arguments.
@@ -260,7 +260,7 @@ func StartTrace() error {
 			gp.traceseq = 0
 			gp.tracelastp = getg().m.p
 			// +PCQuantum because traceFrameForPC expects return PCs and subtracts PCQuantum.
-			id := trace.stackTab.put([]uintptr{startPCforTrace(gp.startpc) + sys.PCQuantum})
+			id := trace.stackTab.put([]uintptr{logicalStackSentinel, startPCforTrace(gp.startpc) + sys.PCQuantum})
 			traceEvent(traceEvGoCreate, -1, gp.goid, uint64(id), stackID)
 		}
 		if status == _Gwaiting {
@@ -278,7 +278,7 @@ func StartTrace() error {
 			gp.traceseq = 0
 			gp.tracelastp = getg().m.p
 			// +PCQuantum because traceFrameForPC expects return PCs and subtracts PCQuantum.
-			id := trace.stackTab.put([]uintptr{startPCforTrace(0) + sys.PCQuantum}) // no start pc
+			id := trace.stackTab.put([]uintptr{logicalStackSentinel, startPCforTrace(0) + sys.PCQuantum}) // no start pc
 			traceEvent(traceEvGoCreate, -1, gp.goid, uint64(id), stackID)
 			gp.traceseq++
 			traceEvent(traceEvGoInSyscall, -1, gp.goid)
@@ -312,11 +312,14 @@ func StartTrace() error {
 	for i, label := range gcMarkWorkerModeStrings[:] {
 		trace.markWorkerLabels[i], bufp = traceString(bufp, pid, label)
 	}
-	traceReleaseBuffer(pid)
+	traceReleaseBuffer(mp, pid)
 
 	unlock(&trace.bufLock)
 
 	unlock(&sched.sysmonlock)
+
+	// Record the current state of HeapGoal to avoid information loss in trace.
+	traceHeapGoal()
 
 	startTheWorldGC()
 	return nil
@@ -676,7 +679,7 @@ func traceEvent(ev byte, skip int, args ...uint64) {
 	//
 	// Note trace_userTaskCreate runs the same check.
 	if !trace.enabled && !mp.startingtrace {
-		traceReleaseBuffer(pid)
+		traceReleaseBuffer(mp, pid)
 		return
 	}
 
@@ -686,7 +689,7 @@ func traceEvent(ev byte, skip int, args ...uint64) {
 		}
 	}
 	traceEventLocked(0, mp, pid, bufp, ev, 0, skip, args...)
-	traceReleaseBuffer(pid)
+	traceReleaseBuffer(mp, pid)
 }
 
 // traceEventLocked writes a single event of type ev to the trace buffer bufp,
@@ -859,27 +862,59 @@ func traceReadCPU() {
 				})
 				buf = bufp.ptr()
 			}
-			for i := range stk {
-				if i >= len(buf.stk) {
-					break
-				}
-				buf.stk[i] = uintptr(stk[i])
+			nstk := 1
+			buf.stk[0] = logicalStackSentinel
+			for ; nstk < len(buf.stk) && nstk-1 < len(stk); nstk++ {
+				buf.stk[nstk] = uintptr(stk[nstk-1])
 			}
-			stackID := trace.stackTab.put(buf.stk[:len(stk)])
+			stackID := trace.stackTab.put(buf.stk[:nstk])
 
 			traceEventLocked(0, nil, 0, bufp, traceEvCPUSample, stackID, 1, timestamp/traceTickDiv, ppid, goid)
 		}
 	}
 }
 
-func traceStackID(mp *m, buf []uintptr, skip int) uint64 {
+// logicalStackSentinel is a sentinel value at pcBuf[0] signifying that
+// pcBuf[1:] holds a logical stack requiring no further processing. Any other
+// value at pcBuf[0] represents a skip value to apply to the physical stack in
+// pcBuf[1:] after inline expansion.
+const logicalStackSentinel = ^uintptr(0)
+
+// traceStackID captures a stack trace into pcBuf, registers it in the trace
+// stack table, and returns its unique ID. pcBuf should have a length equal to
+// traceStackSize. skip controls the number of leaf frames to omit in order to
+// hide tracer internals from stack traces, see CL 5523.
+func traceStackID(mp *m, pcBuf []uintptr, skip int) uint64 {
 	gp := getg()
 	curgp := mp.curg
-	var nstk int
-	if curgp == gp {
-		nstk = callers(skip+1, buf)
-	} else if curgp != nil {
-		nstk = gcallers(curgp, skip, buf)
+	nstk := 1
+	if tracefpunwindoff() || mp.incgocallback() {
+		// Slow path: Unwind using default unwinder. Used when frame pointer
+		// unwinding is unavailable or disabled (tracefpunwindoff), or might
+		// produce incomplete results or crashes (incgocallback). Note that no
+		// cgo callback related crashes have been observed yet. The main
+		// motivation is to take advantage of a potentially registered cgo
+		// symbolizer.
+		pcBuf[0] = logicalStackSentinel
+		if curgp == gp {
+			nstk += callers(skip+1, pcBuf[1:])
+		} else if curgp != nil {
+			nstk += gcallers(curgp, skip, pcBuf[1:])
+		}
+	} else {
+		// Fast path: Unwind using frame pointers.
+		pcBuf[0] = uintptr(skip)
+		if curgp == gp {
+			nstk += fpTracebackPCs(unsafe.Pointer(getcallerfp()), skip, pcBuf[1:])
+		} else if curgp != nil {
+			// We're called on the g0 stack through mcall(fn) or systemstack(fn). To
+			// behave like gcallers above, we start unwinding from sched.bp, which
+			// points to the caller frame of the leaf frame on g's stack. The return
+			// address of the leaf frame is stored in sched.pc, which we manually
+			// capture here.
+			pcBuf[1] = curgp.sched.pc
+			nstk += 1 + fpTracebackPCs(unsafe.Pointer(curgp.sched.bp), skip, pcBuf[2:])
+		}
 	}
 	if nstk > 0 {
 		nstk-- // skip runtime.goexit
@@ -887,8 +922,30 @@ func traceStackID(mp *m, buf []uintptr, skip int) uint64 {
 	if nstk > 0 && curgp.goid == 1 {
 		nstk-- // skip runtime.main
 	}
-	id := trace.stackTab.put(buf[:nstk])
+	id := trace.stackTab.put(pcBuf[:nstk])
 	return uint64(id)
+}
+
+// tracefpunwindoff returns false if frame pointer unwinding for the tracer is
+// disabled via GODEBUG or not supported by the architecture.
+func tracefpunwindoff() bool {
+	// compiler emits frame pointers for amd64 and arm64, but issue 58432 blocks
+	// arm64 support for now.
+	return debug.tracefpunwindoff != 0 || goarch.ArchFamily != goarch.AMD64
+}
+
+// fpTracebackPCs populates pcBuf with the return addresses for each frame and
+// returns the number of PCs written to pcBuf. The returned PCs correspond to
+// "physical frames" rather than "logical frames"; that is if A is inlined into
+// B, this will return a PC for only B.
+func fpTracebackPCs(fp unsafe.Pointer, skip int, pcBuf []uintptr) (i int) {
+	for i = 0; i < len(pcBuf) && fp != nil; i++ {
+		// return addr sits one word above the frame pointer
+		pcBuf[i] = *(*uintptr)(unsafe.Pointer(uintptr(fp) + goarch.PtrSize))
+		// follow the frame pointer to the next one
+		fp = unsafe.Pointer(*(*uintptr)(fp))
+	}
+	return i
 }
 
 // traceAcquireBuffer returns trace buffer to use and, if necessary, locks it.
@@ -907,11 +964,11 @@ func traceAcquireBuffer() (mp *m, pid int32, bufp *traceBufPtr) {
 }
 
 // traceReleaseBuffer releases a buffer previously acquired with traceAcquireBuffer.
-func traceReleaseBuffer(pid int32) {
+func traceReleaseBuffer(mp *m, pid int32) {
 	if pid == traceGlobProc {
 		unlock(&trace.bufLock)
 	}
-	releasem(getg().m)
+	releasem(mp)
 }
 
 // lockRankMayTraceFlush records the lock ranking effects of a
@@ -1117,9 +1174,7 @@ func (tab *traceStackTable) put(pcs []uintptr) uint32 {
 		id = stk.id
 		stk.n = len(pcs)
 		stkpc := stk.stack()
-		for i, pc := range pcs {
-			stkpc[i] = pc
-		}
+		copy(stkpc, pcs)
 		part := int(hash % uintptr(len(tab.tab)))
 		stk.link = tab.tab[part]
 		atomicstorep(unsafe.Pointer(&tab.tab[part]), unsafe.Pointer(stk))
@@ -1177,7 +1232,7 @@ func (tab *traceStackTable) dump(bufp traceBufPtr) traceBufPtr {
 		stk := tab.tab[i].ptr()
 		for ; stk != nil; stk = stk.link.ptr() {
 			var frames []traceFrame
-			frames, bufp = traceFrames(bufp, stk.stack())
+			frames, bufp = traceFrames(bufp, fpunwindExpand(stk.stack()))
 
 			// Estimate the size of this record. This
 			// bound is pretty loose, but avoids counting
@@ -1215,6 +1270,62 @@ func (tab *traceStackTable) dump(bufp traceBufPtr) traceBufPtr {
 	lockInit(&((*tab).lock), lockRankTraceStackTab)
 
 	return bufp
+}
+
+// fpunwindExpand checks if pcBuf contains logical frames (which include inlined
+// frames) or physical frames (produced by frame pointer unwinding) using a
+// sentinel value in pcBuf[0]. Logical frames are simply returned without the
+// sentinel. Physical frames are turned into logical frames via inline unwinding
+// and by applying the skip value that's stored in pcBuf[0].
+func fpunwindExpand(pcBuf []uintptr) []uintptr {
+	if len(pcBuf) > 0 && pcBuf[0] == logicalStackSentinel {
+		// pcBuf contains logical rather than inlined frames, skip has already been
+		// applied, just return it without the sentinel value in pcBuf[0].
+		return pcBuf[1:]
+	}
+
+	var (
+		cache      pcvalueCache
+		lastFuncID = funcID_normal
+		newPCBuf   = make([]uintptr, 0, traceStackSize)
+		skip       = pcBuf[0]
+		// skipOrAdd skips or appends retPC to newPCBuf and returns true if more
+		// pcs can be added.
+		skipOrAdd = func(retPC uintptr) bool {
+			if skip > 0 {
+				skip--
+			} else {
+				newPCBuf = append(newPCBuf, retPC)
+			}
+			return len(newPCBuf) < cap(newPCBuf)
+		}
+	)
+
+outer:
+	for _, retPC := range pcBuf[1:] {
+		callPC := retPC - 1
+		fi := findfunc(callPC)
+		if !fi.valid() {
+			// There is no funcInfo if callPC belongs to a C function. In this case
+			// we still keep the pc, but don't attempt to expand inlined frames.
+			if more := skipOrAdd(retPC); !more {
+				break outer
+			}
+			continue
+		}
+
+		u, uf := newInlineUnwinder(fi, callPC, &cache)
+		for ; uf.valid(); uf = u.next(uf) {
+			sf := u.srcFunc(uf)
+			if sf.funcID == funcID_wrapper && elideWrapperCalling(lastFuncID) {
+				// ignore wrappers
+			} else if more := skipOrAdd(uf.pc + 1); !more {
+				break outer
+			}
+			lastFuncID = sf.funcID
+		}
+	}
+	return newPCBuf
 }
 
 type traceFrame struct {
@@ -1389,7 +1500,7 @@ func traceGoCreate(newg *g, pc uintptr) {
 	newg.traceseq = 0
 	newg.tracelastp = getg().m.p
 	// +PCQuantum because traceFrameForPC expects return PCs and subtracts PCQuantum.
-	id := trace.stackTab.put([]uintptr{startPCforTrace(pc) + sys.PCQuantum})
+	id := trace.stackTab.put([]uintptr{logicalStackSentinel, startPCforTrace(pc) + sys.PCQuantum})
 	traceEvent(traceEvGoCreate, 2, newg.goid, uint64(id))
 }
 
@@ -1442,7 +1553,16 @@ func traceGoUnpark(gp *g, skip int) {
 }
 
 func traceGoSysCall() {
-	traceEvent(traceEvGoSysCall, 1)
+	if tracefpunwindoff() {
+		traceEvent(traceEvGoSysCall, 1)
+	} else {
+		// The default unwinder starts unwinding from gp.syscallsp
+		// which is captured 3 frames above this frame. We could
+		// capture gp.syscallbp to allow frame pointer unwinding to
+		// behave the same, but skipping 3 more frames here is
+		// simpler.
+		traceEvent(traceEvGoSysCall, 4)
+	}
 }
 
 func traceGoSysExit(ts int64) {
@@ -1501,13 +1621,13 @@ func trace_userTaskCreate(id, parentID uint64, taskType string) {
 	// Same as in traceEvent.
 	mp, pid, bufp := traceAcquireBuffer()
 	if !trace.enabled && !mp.startingtrace {
-		traceReleaseBuffer(pid)
+		traceReleaseBuffer(mp, pid)
 		return
 	}
 
 	typeStringID, bufp := traceString(bufp, pid, taskType)
 	traceEventLocked(0, mp, pid, bufp, traceEvUserTaskCreate, 0, 3, id, parentID, typeStringID)
-	traceReleaseBuffer(pid)
+	traceReleaseBuffer(mp, pid)
 }
 
 //go:linkname trace_userTaskEnd runtime/trace.userTaskEnd
@@ -1523,13 +1643,13 @@ func trace_userRegion(id, mode uint64, name string) {
 
 	mp, pid, bufp := traceAcquireBuffer()
 	if !trace.enabled && !mp.startingtrace {
-		traceReleaseBuffer(pid)
+		traceReleaseBuffer(mp, pid)
 		return
 	}
 
 	nameStringID, bufp := traceString(bufp, pid, name)
 	traceEventLocked(0, mp, pid, bufp, traceEvUserRegion, 0, 3, id, mode, nameStringID)
-	traceReleaseBuffer(pid)
+	traceReleaseBuffer(mp, pid)
 }
 
 //go:linkname trace_userLog runtime/trace.userLog
@@ -1540,16 +1660,18 @@ func trace_userLog(id uint64, category, message string) {
 
 	mp, pid, bufp := traceAcquireBuffer()
 	if !trace.enabled && !mp.startingtrace {
-		traceReleaseBuffer(pid)
+		traceReleaseBuffer(mp, pid)
 		return
 	}
 
 	categoryID, bufp := traceString(bufp, pid, category)
 
-	extraSpace := traceBytesPerNumber + len(message) // extraSpace for the value string
+	// The log message is recorded after all of the normal trace event
+	// arguments, including the task, category, and stack IDs. We must ask
+	// traceEventLocked to reserve extra space for the length of the message
+	// and the message itself.
+	extraSpace := traceBytesPerNumber + len(message)
 	traceEventLocked(extraSpace, mp, pid, bufp, traceEvUserLog, 0, 3, id, categoryID)
-	// traceEventLocked reserved extra space for val and len(val)
-	// in buf, so buf now has room for the following.
 	buf := bufp.ptr()
 
 	// double-check the message and its length can fit.
@@ -1561,7 +1683,7 @@ func trace_userLog(id uint64, category, message string) {
 	buf.varint(uint64(slen))
 	buf.pos += copy(buf.arr[buf.pos:], message[:slen])
 
-	traceReleaseBuffer(pid)
+	traceReleaseBuffer(mp, pid)
 }
 
 // the start PC of a goroutine for tracing purposes. If pc is a wrapper,

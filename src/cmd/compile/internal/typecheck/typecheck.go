@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"go/constant"
 	"go/token"
+	"internal/types/errors"
 	"strings"
 
 	"cmd/compile/internal/base"
@@ -46,16 +47,6 @@ func Callee(n ir.Node) ir.Node {
 }
 
 var importlist []*ir.Func
-
-// AllImportedBodies reads in the bodies of all imported functions and typechecks
-// them, if needed.
-func AllImportedBodies() {
-	for _, n := range importlist {
-		if n.Inl != nil {
-			ImportedBody(n)
-		}
-	}
-}
 
 var traceIndent []byte
 
@@ -126,21 +117,8 @@ func Resolve(n ir.Node) (res ir.Node) {
 		return n
 	}
 
-	// only trace if there's work to do
-	if base.EnableTrace && base.Flag.LowerT {
-		defer tracePrint("resolve", n)(&res)
-	}
-
-	if sym := n.Sym(); sym.Pkg != types.LocalPkg {
-		return expandDecl(n)
-	}
-
-	r := ir.AsNode(n.Sym().Def)
-	if r == nil {
-		return n
-	}
-
-	return r
+	base.Fatalf("unexpected NONAME node: %+v", n)
+	panic("unreachable")
 }
 
 func typecheckslice(l []ir.Node, top int) {
@@ -309,7 +287,7 @@ func typecheck(n ir.Node, top int) (res ir.Node) {
 						return n
 					}
 				}
-				base.ErrorfAt(n.Pos(), "invalid recursive type alias %v%s", n, cycleTrace(cycle))
+				base.ErrorfAt(n.Pos(), errors.InvalidDeclCycle, "invalid recursive type alias %v%s", n, cycleTrace(cycle))
 			}
 
 		case ir.OLITERAL:
@@ -317,7 +295,7 @@ func typecheck(n ir.Node, top int) (res ir.Node) {
 				base.Errorf("%v is not a type", n)
 				break
 			}
-			base.ErrorfAt(n.Pos(), "constant definition loop%s", cycleTrace(cycleFor(n)))
+			base.ErrorfAt(n.Pos(), errors.InvalidInitCycle, "constant definition loop%s", cycleTrace(cycleFor(n)))
 		}
 
 		if base.Errors() == 0 {
@@ -359,7 +337,7 @@ func typecheck(n ir.Node, top int) (res ir.Node) {
 	case ir.OAPPEND:
 		// Must be used (and not BinaryExpr/UnaryExpr).
 		isStmt = false
-	case ir.OCLOSE, ir.ODELETE, ir.OPANIC, ir.OPRINT, ir.OPRINTN:
+	case ir.OCLEAR, ir.OCLOSE, ir.ODELETE, ir.OPANIC, ir.OPRINT, ir.OPRINTN:
 		// Must not be used.
 		isExpr = false
 		isStmt = true
@@ -644,6 +622,10 @@ func typecheck1(n ir.Node, top int) ir.Node {
 		n := n.(*ir.BinaryExpr)
 		return tcComplex(n)
 
+	case ir.OCLEAR:
+		n := n.(*ir.UnaryExpr)
+		return tcClear(n)
+
 	case ir.OCLOSE:
 		n := n.(*ir.UnaryExpr)
 		return tcClose(n)
@@ -907,7 +889,7 @@ func RewriteNonNameCall(n *ir.CallExpr) {
 
 	tmp := Temp((*np).Type())
 	as := ir.NewAssignStmt(base.Pos, tmp, *np)
-	as.Def = true
+	as.PtrInit().Append(Stmt(ir.NewDecl(n.Pos(), ir.ODCL, tmp)))
 	*np = tmp
 
 	if static {
@@ -1469,7 +1451,7 @@ func sigrepr(t *types.Type, isddd bool) string {
 	return t.String()
 }
 
-// sigerr returns the signature of the types at the call or return.
+// fmtSignature returns the signature of the types at the call or return.
 func fmtSignature(nl ir.Nodes, isddd bool) string {
 	if len(nl) < 1 {
 		return "()"
@@ -1484,7 +1466,7 @@ func fmtSignature(nl ir.Nodes, isddd bool) string {
 	return fmt.Sprintf("(%s)", strings.Join(typeStrings, ", "))
 }
 
-// type check composite
+// type check composite.
 func fielddup(name string, hash map[string]bool) {
 	if hash[name] {
 		base.Errorf("duplicate field name in struct literal: %s", name)
@@ -1624,7 +1606,7 @@ func stringtoruneslit(n *ir.ConvExpr) ir.Node {
 	var l []ir.Node
 	i := 0
 	for _, r := range ir.StringVal(n.X) {
-		l = append(l, ir.NewKeyExpr(base.Pos, ir.NewInt(int64(i)), ir.NewInt(int64(r))))
+		l = append(l, ir.NewKeyExpr(base.Pos, ir.NewInt(base.Pos, int64(i)), ir.NewInt(base.Pos, int64(r))))
 		i++
 	}
 

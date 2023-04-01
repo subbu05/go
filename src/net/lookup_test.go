@@ -49,21 +49,21 @@ var lookupGoogleSRVTests = []struct {
 	cname, target        string
 }{
 	{
-		"xmpp-server", "tcp", "google.com",
+		"ldap", "tcp", "google.com",
 		"google.com.", "google.com.",
 	},
 	{
-		"xmpp-server", "tcp", "google.com.",
+		"ldap", "tcp", "google.com.",
 		"google.com.", "google.com.",
 	},
 
 	// non-standard back door
 	{
-		"", "", "_xmpp-server._tcp.google.com",
+		"", "", "_ldap._tcp.google.com",
 		"google.com.", "google.com.",
 	},
 	{
-		"", "", "_xmpp-server._tcp.google.com.",
+		"", "", "_ldap._tcp.google.com.",
 		"google.com.", "google.com.",
 	},
 }
@@ -74,7 +74,7 @@ func TestLookupGoogleSRV(t *testing.T) {
 	t.Parallel()
 	mustHaveExternalNetwork(t)
 
-	if iOS() {
+	if runtime.GOOS == "ios" {
 		t.Skip("no resolv.conf on iOS")
 	}
 
@@ -123,7 +123,7 @@ func TestLookupGmailMX(t *testing.T) {
 	t.Parallel()
 	mustHaveExternalNetwork(t)
 
-	if iOS() {
+	if runtime.GOOS == "ios" {
 		t.Skip("no resolv.conf on iOS")
 	}
 
@@ -169,7 +169,7 @@ func TestLookupGmailNS(t *testing.T) {
 	t.Parallel()
 	mustHaveExternalNetwork(t)
 
-	if iOS() {
+	if runtime.GOOS == "ios" {
 		t.Skip("no resolv.conf on iOS")
 	}
 
@@ -218,7 +218,7 @@ func TestLookupGmailTXT(t *testing.T) {
 	t.Parallel()
 	mustHaveExternalNetwork(t)
 
-	if iOS() {
+	if runtime.GOOS == "ios" {
 		t.Skip("no resolv.conf on iOS")
 	}
 
@@ -348,6 +348,8 @@ var lookupCNAMETests = []struct {
 	{"www.iana.org", "icann.org."},
 	{"www.iana.org.", "icann.org."},
 	{"www.google.com", "google.com."},
+	{"google.com", "google.com."},
+	{"cname-to-txt.go4.org", "test-txt-record.go4.org."},
 }
 
 func TestLookupCNAME(t *testing.T) {
@@ -641,7 +643,7 @@ func TestLookupDotsWithRemoteSource(t *testing.T) {
 		t.Skip("IPv4 is required")
 	}
 
-	if iOS() {
+	if runtime.GOOS == "ios" {
 		t.Skip("no resolv.conf on iOS")
 	}
 
@@ -701,16 +703,16 @@ func testDots(t *testing.T, mode string) {
 		}
 	}
 
-	cname, srvs, err := LookupSRV("xmpp-server", "tcp", "google.com")
+	cname, srvs, err := LookupSRV("ldap", "tcp", "google.com")
 	if err != nil {
-		t.Errorf("LookupSRV(xmpp-server, tcp, google.com): %v (mode=%v)", err, mode)
+		t.Errorf("LookupSRV(ldap, tcp, google.com): %v (mode=%v)", err, mode)
 	} else {
 		if !hasSuffixFold(cname, ".google.com.") {
-			t.Errorf("LookupSRV(xmpp-server, tcp, google.com) returned cname=%v, want name ending in .google.com. with trailing dot (mode=%v)", cname, mode)
+			t.Errorf("LookupSRV(ldap, tcp, google.com) returned cname=%v, want name ending in .google.com. with trailing dot (mode=%v)", cname, mode)
 		}
 		for _, srv := range srvs {
 			if !hasSuffixFold(srv.Target, ".google.com.") {
-				t.Errorf("LookupSRV(xmpp-server, tcp, google.com) returned addrs=%v, want names ending in .google.com. with trailing dot (mode=%v)", srvString(srvs), mode)
+				t.Errorf("LookupSRV(ldap, tcp, google.com) returned addrs=%v, want names ending in .google.com. with trailing dot (mode=%v)", srvString(srvs), mode)
 				break
 			}
 		}
@@ -1026,10 +1028,10 @@ func (lcr *lookupCustomResolver) dial() func(ctx context.Context, network, addre
 // TestConcurrentPreferGoResolversDial tests that multiple resolvers with the
 // PreferGo option used concurrently are all dialed properly.
 func TestConcurrentPreferGoResolversDial(t *testing.T) {
-	// The windows and plan9 implementation of the resolver does not use
-	// the Dial function.
 	switch runtime.GOOS {
-	case "windows", "plan9":
+	case "plan9":
+		// TODO: plan9 implementation of the resolver uses the Dial function since
+		// https://go.dev/cl/409234, this test could probably be reenabled.
 		t.Skipf("skip on %v", runtime.GOOS)
 	}
 

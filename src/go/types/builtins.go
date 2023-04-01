@@ -46,7 +46,7 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 	switch id {
 	default:
 		// make argument getter
-		xlist, _ := check.exprList(call.Args, false)
+		xlist := check.exprList(call.Args)
 		arg = func(x *operand, i int) { *x = *xlist[i] }
 		nargs = len(xlist)
 		// evaluate first argument, if present
@@ -232,6 +232,29 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 		x.mode = mode
 		x.typ = Typ[Int]
 		x.val = val
+
+	case _Clear:
+		// clear(m)
+		if !check.allowVersion(check.pkg, 1, 21) {
+			check.error(call.Fun, UnsupportedFeature, "clear requires go1.21 or later")
+			return
+		}
+
+		if !underIs(x.typ, func(u Type) bool {
+			switch u.(type) {
+			case *Map, *Slice:
+				return true
+			}
+			check.errorf(x, InvalidClear, invalidArg+"cannot clear %s: argument must be (or constrained by) map or slice", x)
+			return false
+		}) {
+			return
+		}
+
+		x.mode = novalue
+		if check.Types != nil {
+			check.recordBuiltinType(call.Fun, makeSig(nil, x.typ))
+		}
 
 	case _Close:
 		// close(c)
@@ -656,7 +679,7 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 			return
 		}
 
-		check.expr(x, selx.X)
+		check.expr(nil, x, selx.X)
 		if x.mode == invalid {
 			return
 		}
@@ -684,7 +707,7 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 		// TODO(gri) Should we pass x.typ instead of base (and have indirect report if derefStructPtr indirected)?
 		check.recordSelection(selx, FieldVal, base, obj, index, false)
 
-		// record the selector expression (was bug - issue #47895)
+		// record the selector expression (was bug - go.dev/issue/47895)
 		{
 			mode := value
 			if x.mode == variable || indirect {
@@ -703,8 +726,13 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 				check.recordBuiltinType(call.Fun, makeSig(Typ[Uintptr], obj.Type()))
 			}
 		} else {
+			offs := check.conf.offsetof(base, index)
+			if offs < 0 {
+				check.errorf(x, TypeTooLarge, "%s is too large", x)
+				return
+			}
 			x.mode = constant_
-			x.val = constant.MakeInt64(check.conf.offsetof(base, index))
+			x.val = constant.MakeInt64(offs)
 			// result is constant - no need to record signature
 		}
 		x.typ = Typ[Uintptr]
@@ -722,8 +750,13 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 				check.recordBuiltinType(call.Fun, makeSig(Typ[Uintptr], x.typ))
 			}
 		} else {
+			size := check.conf.sizeof(x.typ)
+			if size < 0 {
+				check.errorf(x, TypeTooLarge, "%s is too large", x)
+				return
+			}
 			x.mode = constant_
-			x.val = constant.MakeInt64(check.conf.sizeof(x.typ))
+			x.val = constant.MakeInt64(size)
 			// result is constant - no need to record signature
 		}
 		x.typ = Typ[Uintptr]
@@ -846,7 +879,7 @@ func (check *Checker) builtin(x *operand, call *ast.CallExpr, id builtinId) (_ b
 		var t operand
 		x1 := x
 		for _, arg := range call.Args {
-			check.rawExpr(x1, arg, nil, false) // permit trace for types, e.g.: new(trace(T))
+			check.rawExpr(nil, x1, arg, nil, false) // permit trace for types, e.g.: new(trace(T))
 			check.dump("%v: %s", x1.Pos(), x1)
 			x1 = &t // use incoming x only for first argument
 		}
@@ -923,7 +956,7 @@ func (check *Checker) applyTypeFunc(f func(Type) Type, x *operand, id builtinId)
 
 		// We can type-check this fine but we're introducing a synthetic
 		// type parameter for the result. It's not clear what the API
-		// implications are here. Report an error for 1.18 (see #50912),
+		// implications are here. Report an error for 1.18 (see go.dev/issue/50912),
 		// but continue type-checking.
 		var code Code
 		switch id {
@@ -936,12 +969,12 @@ func (check *Checker) applyTypeFunc(f func(Type) Type, x *operand, id builtinId)
 		default:
 			unreachable()
 		}
-		check.softErrorf(x, code, "%s not supported as argument to %s for go1.18 (see issue #50937)", x, predeclaredFuncs[id].name)
+		check.softErrorf(x, code, "%s not supported as argument to %s for go1.18 (see go.dev/issue/50937)", x, predeclaredFuncs[id].name)
 
 		// Construct a suitable new type parameter for the result type.
 		// The type parameter is placed in the current package so export/import
 		// works as expected.
-		tpar := NewTypeName(token.NoPos, check.pkg, tp.obj.name, nil)
+		tpar := NewTypeName(nopos, check.pkg, tp.obj.name, nil)
 		ptyp := check.newTypeParam(tpar, NewInterfaceType(nil, []Type{NewUnion(terms)})) // assigns type to tpar as a side-effect
 		ptyp.index = tp.index
 
@@ -956,13 +989,13 @@ func (check *Checker) applyTypeFunc(f func(Type) Type, x *operand, id builtinId)
 func makeSig(res Type, args ...Type) *Signature {
 	list := make([]*Var, len(args))
 	for i, param := range args {
-		list[i] = NewVar(token.NoPos, nil, "", Default(param))
+		list[i] = NewVar(nopos, nil, "", Default(param))
 	}
 	params := NewTuple(list...)
 	var result *Tuple
 	if res != nil {
 		assert(!isUntyped(res))
-		result = NewTuple(NewVar(token.NoPos, nil, "", res))
+		result = NewTuple(NewVar(nopos, nil, "", res))
 	}
 	return &Signature{params: params, results: result}
 }

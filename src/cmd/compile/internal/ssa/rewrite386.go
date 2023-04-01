@@ -1,5 +1,4 @@
-// Code generated from _gen/386.rules; DO NOT EDIT.
-// generated with: cd _gen; go run .
+// Code generated from _gen/386.rules using 'go generate'; DO NOT EDIT.
 
 package ssa
 
@@ -314,6 +313,17 @@ func rewriteValue386(v *Value) bool {
 	case OpCtz16:
 		return rewriteValue386_OpCtz16(v)
 	case OpCtz16NonZero:
+		v.Op = Op386BSFL
+		return true
+	case OpCtz32:
+		v.Op = Op386LoweredCtz32
+		return true
+	case OpCtz32NonZero:
+		v.Op = Op386BSFL
+		return true
+	case OpCtz8:
+		return rewriteValue386_OpCtz8(v)
+	case OpCtz8NonZero:
 		v.Op = Op386BSFL
 		return true
 	case OpCvt32Fto32:
@@ -727,7 +737,8 @@ func rewriteValue386_Op386ADCL(v *Value) bool {
 func rewriteValue386_Op386ADDL(v *Value) bool {
 	v_1 := v.Args[1]
 	v_0 := v.Args[0]
-	// match: (ADDL x (MOVLconst [c]))
+	// match: (ADDL x (MOVLconst <t> [c]))
+	// cond: !t.IsPtr()
 	// result: (ADDLconst [c] x)
 	for {
 		for _i0 := 0; _i0 <= 1; _i0, v_0, v_1 = _i0+1, v_1, v_0 {
@@ -735,7 +746,11 @@ func rewriteValue386_Op386ADDL(v *Value) bool {
 			if v_1.Op != Op386MOVLconst {
 				continue
 			}
+			t := v_1.Type
 			c := auxIntToInt32(v_1.AuxInt)
+			if !(!t.IsPtr()) {
+				continue
+			}
 			v.reset(Op386ADDLconst)
 			v.AuxInt = int32ToAuxInt(c)
 			v.AddArg(x)
@@ -8523,6 +8538,22 @@ func rewriteValue386_OpCtz16(v *Value) bool {
 		return true
 	}
 }
+func rewriteValue386_OpCtz8(v *Value) bool {
+	v_0 := v.Args[0]
+	b := v.Block
+	typ := &b.Func.Config.Types
+	// match: (Ctz8 x)
+	// result: (BSFL (ORLconst <typ.UInt32> [0x100] x))
+	for {
+		x := v_0
+		v.reset(Op386BSFL)
+		v0 := b.NewValue0(v.Pos, Op386ORLconst, typ.UInt32)
+		v0.AuxInt = int32ToAuxInt(0x100)
+		v0.AddArg(x)
+		v.AddArg(v0)
+		return true
+	}
+}
 func rewriteValue386_OpDiv8(v *Value) bool {
 	v_1 := v.Args[1]
 	v_0 := v.Args[0]
@@ -9051,17 +9082,44 @@ func rewriteValue386_OpLoad(v *Value) bool {
 	return false
 }
 func rewriteValue386_OpLocalAddr(v *Value) bool {
+	v_1 := v.Args[1]
 	v_0 := v.Args[0]
-	// match: (LocalAddr {sym} base _)
-	// result: (LEAL {sym} base)
+	b := v.Block
+	typ := &b.Func.Config.Types
+	// match: (LocalAddr <t> {sym} base mem)
+	// cond: t.Elem().HasPointers()
+	// result: (LEAL {sym} (SPanchored base mem))
 	for {
+		t := v.Type
 		sym := auxToSym(v.Aux)
 		base := v_0
+		mem := v_1
+		if !(t.Elem().HasPointers()) {
+			break
+		}
+		v.reset(Op386LEAL)
+		v.Aux = symToAux(sym)
+		v0 := b.NewValue0(v.Pos, OpSPanchored, typ.Uintptr)
+		v0.AddArg2(base, mem)
+		v.AddArg(v0)
+		return true
+	}
+	// match: (LocalAddr <t> {sym} base _)
+	// cond: !t.Elem().HasPointers()
+	// result: (LEAL {sym} base)
+	for {
+		t := v.Type
+		sym := auxToSym(v.Aux)
+		base := v_0
+		if !(!t.Elem().HasPointers()) {
+			break
+		}
 		v.reset(Op386LEAL)
 		v.Aux = symToAux(sym)
 		v.AddArg(base)
 		return true
 	}
+	return false
 }
 func rewriteValue386_OpLsh16x16(v *Value) bool {
 	v_1 := v.Args[1]

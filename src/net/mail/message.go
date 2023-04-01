@@ -54,7 +54,7 @@ func ReadMessage(r io.Reader) (msg *Message, err error) {
 	tp := textproto.NewReader(bufio.NewReader(r))
 
 	hdr, err := tp.ReadMIMEHeader()
-	if err != nil {
+	if err != nil && (err != io.EOF || len(hdr) == 0) {
 		return nil, err
 	}
 
@@ -850,7 +850,7 @@ func isVchar(r rune) bool {
 }
 
 // isMultibyte reports whether r is a multi-byte UTF-8 character
-// as supported by RFC 6532
+// as supported by RFC 6532.
 func isMultibyte(r rune) bool {
 	return r >= utf8.RuneSelf
 }

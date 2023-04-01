@@ -242,7 +242,7 @@ const (
 	// rather than the symbol's address.
 	R_ADDRPOWER_TOCREL
 
-	// R_ADDRPOWER_TOCREL relocates a D-form, DS-form instruction sequence like
+	// R_ADDRPOWER_TOCREL_DS relocates a D-form, DS-form instruction sequence like
 	// R_ADDRPOWER_DS but inserts the offset from the TOC to the address of the
 	// relocated symbol rather than the symbol's address.
 	R_ADDRPOWER_TOCREL_DS
@@ -252,7 +252,7 @@ const (
 	// and the low 16 are stored in the suffix. The address is absolute.
 	R_ADDRPOWER_D34
 
-	// R_ADDPOWER_PCREL34 relates a single prefixed D-form load/store/add operation.
+	// R_ADDRPOWER_PCREL34 relates a single prefixed D-form load/store/add operation.
 	// All prefixed forms are D form. The resulting address is relative to the
 	// PC. It is a signed 34 bit offset.
 	R_ADDRPOWER_PCREL34
@@ -332,6 +332,10 @@ const (
 	// of a symbol. This isn't a real relocation, it can be placed in anywhere
 	// in a symbol and target any symbols.
 	R_XCOFFREF
+
+	// R_PEIMAGEOFF resolves to a 32-bit offset from the start address of where
+	// the executable file is mapped in memory.
+	R_PEIMAGEOFF
 
 	// R_WEAK marks the relocation as a weak reference.
 	// A weak relocation does not make the symbol it refers to reachable,

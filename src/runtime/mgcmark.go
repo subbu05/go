@@ -414,7 +414,7 @@ func gcAssistAlloc(gp *g) {
 
 	traced := false
 retry:
-	if go119MemoryLimitSupport && gcCPULimiter.limiting() {
+	if gcCPULimiter.limiting() {
 		// If the CPU limiter is enabled, intentionally don't
 		// assist to reduce the amount of CPU time spent in the GC.
 		if traced {
@@ -797,11 +797,10 @@ func scanstack(gp *g, gcw *gcWork) int64 {
 	}
 
 	// Scan the stack. Accumulate a list of stack objects.
-	scanframe := func(frame *stkframe, unused unsafe.Pointer) bool {
-		scanframeworker(frame, &state, gcw)
-		return true
+	var u unwinder
+	for u.init(gp, 0); u.valid(); u.next() {
+		scanframeworker(&u.frame, &state, gcw)
 	}
-	gentraceback(^uintptr(0), ^uintptr(0), 0, gp, 0, nil, 0x7fffffff, scanframe, nil, 0)
 
 	// Find additional pointers that point into the stack from the heap.
 	// Currently this includes defers and panics. See also function copystack.
@@ -1092,7 +1091,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 				// Flush the write barrier
 				// buffer; this may create
 				// more work.
-				wbBufFlush(nil, 0)
+				wbBufFlush()
 				b = gcw.tryGet()
 			}
 		}
@@ -1171,7 +1170,7 @@ func gcDrainN(gcw *gcWork, scanWork int64) int64 {
 			if b == 0 {
 				// Flush the write barrier buffer;
 				// this may create more work.
-				wbBufFlush(nil, 0)
+				wbBufFlush()
 				b = gcw.tryGet()
 			}
 		}

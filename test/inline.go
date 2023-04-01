@@ -1,4 +1,4 @@
-// errorcheckwithauto -0 -m -d=inlfuncswithclosures=1
+// errorcheckwithauto -0 -m -d=inlfuncswithclosures=1 -d=inlstaticinit=1
 
 // Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -10,6 +10,7 @@
 package foo
 
 import (
+	"errors"
 	"runtime"
 	"unsafe"
 )
@@ -54,6 +55,8 @@ func f2() int { // ERROR "can inline f2"
 	tmp2 := tmp1
 	return tmp2(0) // ERROR "inlining call to h"
 }
+
+var abc = errors.New("abc") // ERROR "inlining call to errors.New"
 
 var somethingWrong error
 
@@ -243,13 +246,13 @@ func ff(x int) { // ERROR "can inline ff"
 	if x < 0 {
 		return
 	}
-	gg(x - 1)
+	gg(x - 1) // ERROR "inlining call to gg" "inlining call to hh"
 }
 func gg(x int) { // ERROR "can inline gg"
-	hh(x - 1)
+	hh(x - 1) // ERROR "inlining call to hh" "inlining call to ff"
 }
 func hh(x int) { // ERROR "can inline hh"
-	ff(x - 1) // ERROR "inlining call to ff"  // ERROR "inlining call to gg"
+	ff(x - 1) // ERROR "inlining call to ff" "inlining call to gg"
 }
 
 // Issue #14768 - make sure we can inline for loops.

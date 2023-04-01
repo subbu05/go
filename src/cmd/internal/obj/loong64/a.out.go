@@ -265,6 +265,7 @@ const (
 	ALU12IW
 	ALU32ID
 	ALU52ID
+	APCALAU12I
 	APCADDU12I
 	AJIRL
 	ABGE
@@ -390,6 +391,11 @@ const (
 	AMOVDV
 	AMOVVF
 	AMOVVD
+
+	// 2.2.10. Other Miscellaneous Instructions
+	ARDTIMELW
+	ARDTIMEHW
+	ARDTIMED
 
 	ALAST
 

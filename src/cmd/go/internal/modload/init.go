@@ -26,6 +26,7 @@ import (
 	"cmd/go/internal/modconv"
 	"cmd/go/internal/modfetch"
 	"cmd/go/internal/search"
+	"cmd/go/internal/slices"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -220,15 +221,19 @@ func (mms *MainModuleSet) HighestReplaced() map[string]string {
 // GoVersion returns the go version set on the single module, in module mode,
 // or the go.work file in workspace mode.
 func (mms *MainModuleSet) GoVersion() string {
-	if !inWorkspaceMode() {
+	switch {
+	case inWorkspaceMode():
+		v := mms.workFileGoVersion
+		if v == "" {
+			// Fall back to 1.18 for go.work files.
+			v = "1.18"
+		}
+		return v
+	case mms == nil || len(mms.versions) == 0:
+		return "1.18"
+	default:
 		return modFileGoVersion(mms.ModFile(mms.mustGetSingleMainModule()))
 	}
-	v := mms.workFileGoVersion
-	if v == "" {
-		// Fall back to 1.18 for go.work files.
-		v = "1.18"
-	}
-	return v
 }
 
 func (mms *MainModuleSet) WorkFileReplaceMap() map[module.Version]module.Version {
@@ -383,8 +388,8 @@ func Init() {
 			base.Fatalf("go: -modfile cannot be used with commands that ignore the current module")
 		}
 		modRoots = nil
-	} else if inWorkspaceMode() {
-		// We're in workspace mode.
+	} else if workFilePath != "" {
+		// We're in workspace mode, which implies module mode.
 	} else {
 		if modRoot := findModuleRoot(base.Cwd()); modRoot == "" {
 			if cfg.ModFile != "" {
@@ -490,6 +495,9 @@ func VendorDir() string {
 func inWorkspaceMode() bool {
 	if !initialized {
 		panic("inWorkspaceMode called before modload.Init called")
+	}
+	if !Enabled() {
+		return false
 	}
 	return workFilePath != ""
 }
@@ -673,7 +681,7 @@ func LoadModFile(ctx context.Context) *Requirements {
 			modfetch.WorkspaceGoSumFiles = append(modfetch.WorkspaceGoSumFiles, sumFile)
 		}
 		modfetch.GoSumFile = workFilePath + ".sum"
-	} else if modRoots == nil {
+	} else if len(modRoots) == 0 {
 		// We're in module mode, but not inside a module.
 		//
 		// Commands like 'go build', 'go run', 'go list' have no go.mod file to
@@ -707,6 +715,12 @@ func LoadModFile(ctx context.Context) *Requirements {
 			pruning = workspace
 		}
 		requirements = newRequirements(pruning, nil, nil)
+		if cfg.BuildMod == "vendor" {
+			// For issue 56536: Some users may have GOFLAGS=-mod=vendor set.
+			// Make sure it behaves as though the fake module is vendored
+			// with no dependencies.
+			requirements.initVendor(nil)
+		}
 		return requirements
 	}
 
@@ -719,7 +733,7 @@ func LoadModFile(ctx context.Context) *Requirements {
 		data, f, err := ReadModFile(gomod, fixVersion(ctx, &fixed))
 		if err != nil {
 			if inWorkspaceMode() {
-				base.Fatalf("go: cannot load module listed in go.work file: %v", err)
+				base.Fatalf("go: cannot load module %s listed in go.work file: %v", base.ShortPath(gomod), err)
 			} else {
 				base.Fatalf("go: %v", err)
 			}
@@ -984,7 +998,7 @@ func makeMainModules(ms []module.Version, rootDirs []string, modFiles []*modfile
 	}
 	modRootContainingCWD := findModuleRoot(base.Cwd())
 	mainModules := &MainModuleSet{
-		versions:           ms[:len(ms):len(ms)],
+		versions:           slices.Clip(ms),
 		inGorootSrc:        map[module.Version]bool{},
 		pathPrefix:         map[module.Version]string{},
 		modRoot:            map[module.Version]string{},

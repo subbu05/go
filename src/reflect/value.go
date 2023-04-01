@@ -2743,7 +2743,7 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 // it references will not be garbage collected, so programs must keep
 // a separate, correctly typed pointer to the underlying data.
 //
-// Deprecated: Use unsafe.String or unsafe.StringData instead.
+// In new code, use unsafe.String or unsafe.StringData instead.
 type StringHeader struct {
 	Data uintptr
 	Len  int
@@ -2756,7 +2756,7 @@ type StringHeader struct {
 // it references will not be garbage collected, so programs must keep
 // a separate, correctly typed pointer to the underlying data.
 //
-// Deprecated: Use unsafe.Slice or unsafe.SliceData instead.
+// In new code, use unsafe.Slice or unsafe.SliceData instead.
 type SliceHeader struct {
 	Data uintptr
 	Len  int
@@ -2825,6 +2825,22 @@ func (v Value) extendSlice(n int) Value {
 	v.grow(n) // fine to treat as assignable since we allocate a new slice header
 	s.Len += n
 	return v
+}
+
+// Clear clears the contents of a map or zeros the contents of a slice.
+//
+// It panics if v's Kind is not Map or Slice.
+func (v Value) Clear() {
+	switch v.Kind() {
+	case Slice:
+		sh := *(*unsafeheader.Slice)(v.ptr)
+		st := (*sliceType)(unsafe.Pointer(v.typ))
+		typedarrayclear(st.elem, sh.Data, sh.Len)
+	case Map:
+		mapclear(v.typ, v.pointer())
+	default:
+		panic(&ValueError{"reflect.Value.Clear", v.Kind()})
+	}
 }
 
 // Append appends the values x to a slice s and returns the resulting slice.
@@ -3284,7 +3300,8 @@ func (v Value) CanConvert(t Type) bool {
 
 // Comparable reports whether the value v is comparable.
 // If the type of v is an interface, this checks the dynamic type.
-// If this reports true then v.Interface() == x will not panic for any x.
+// If this reports true then v.Interface() == x will not panic for any x,
+// nor will v.Equal(u) for any Value u.
 func (v Value) Comparable() bool {
 	k := v.Kind()
 	switch k {
@@ -3343,7 +3360,7 @@ func (v Value) Equal(u Value) bool {
 		return false
 	}
 
-	// Handle ach Kind directly rather than calling valueInterface
+	// Handle each Kind directly rather than calling valueInterface
 	// to avoid allocating.
 	switch v.Kind() {
 	default:
@@ -3773,6 +3790,8 @@ func mapiternext(it *hiter)
 //go:noescape
 func maplen(m unsafe.Pointer) int
 
+func mapclear(t *rtype, m unsafe.Pointer)
+
 // call calls fn with "stackArgsSize" bytes of stack arguments laid out
 // at stackArgs and register arguments laid out in regArgs. frameSize is
 // the total amount of stack space that will be reserved by call, so this
@@ -3835,6 +3854,12 @@ func typedmemclrpartial(t *rtype, ptr unsafe.Pointer, off, size uintptr)
 //
 //go:noescape
 func typedslicecopy(elemType *rtype, dst, src unsafeheader.Slice) int
+
+// typedarrayclear zeroes the value at ptr of an array of elemType,
+// only clears len elem.
+//
+//go:noescape
+func typedarrayclear(elemType *rtype, ptr unsafe.Pointer, len int)
 
 //go:noescape
 func typehash(t *rtype, p unsafe.Pointer, h uintptr) uintptr

@@ -26,6 +26,7 @@ func open(name *byte, mode, perm int32) int32        { panic("not implemented") 
 func closefd(fd int32) int32                         { panic("not implemented") }
 func read(fd int32, p unsafe.Pointer, n int32) int32 { panic("not implemented") }
 
+//go:wasmimport gojs runtime.wasmWrite
 //go:noescape
 func wasmWrite(fd uintptr, p unsafe.Pointer, n int32)
 
@@ -101,9 +102,11 @@ func mdestroy(mp *m) {
 }
 
 func osinit() {
+	// https://webassembly.github.io/spec/core/exec/runtime.html#memory-instances
+	physPageSize = 64 * 1024
+	initBloc()
 	ncpu = 1
 	getg().m.procid = 2
-	physPageSize = 64 * 1024
 }
 
 // wasm has no signals
@@ -117,6 +120,7 @@ func crash() {
 	*(*int32)(nil) = 0
 }
 
+//go:wasmimport gojs runtime.getRandomData
 func getRandomData(r []byte)
 
 func goenvs() {
@@ -165,3 +169,6 @@ const preemptMSupported = false
 func preemptM(mp *m) {
 	// No threads, so nothing to do.
 }
+
+// getcallerfp returns the address of the frame pointer in the callers frame or 0 if not implemented.
+func getcallerfp() uintptr { return 0 }

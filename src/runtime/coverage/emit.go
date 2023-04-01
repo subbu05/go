@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -241,7 +242,7 @@ func prepareForMetaEmit() ([]rtcov.CovMetaBlob, error) {
 	return ml, nil
 }
 
-// emitMetaData emits the meta-data output file to the specified
+// emitMetaDataToDirectory emits the meta-data output file to the specified
 // directory, returning an error if something went wrong.
 func emitMetaDataToDirectory(outdir string, ml []rtcov.CovMetaBlob) error {
 	ml, err := prepareForMetaEmit()
@@ -289,7 +290,7 @@ func emitCounterData() {
 	}
 }
 
-// emitMetaData emits the counter-data output file for this coverage run.
+// emitCounterDataToDirectory emits the counter-data output file for this coverage run.
 func emitCounterDataToDirectory(outdir string) error {
 	// Ask the runtime for the list of coverage counter symbols.
 	cl := getCovCounterList()
@@ -336,7 +337,7 @@ func emitCounterDataToDirectory(outdir string) error {
 	return nil
 }
 
-// emitMetaData emits counter data for this coverage run to an io.Writer.
+// emitCounterDataToWriter emits counter data for this coverage run to an io.Writer.
 func (s *emitState) emitCounterDataToWriter(w io.Writer) error {
 	if err := s.emitCounterDataFile(finalHash, w); err != nil {
 		return err
@@ -357,7 +358,7 @@ func (s *emitState) openMetaFile(metaHash [16]byte, metaLen uint64) error {
 	fi, err := os.Stat(s.mfname)
 	if err != nil || fi.Size() != int64(metaLen) {
 		// We need a new meta-file.
-		tname := "tmp." + fn + fmt.Sprintf("%d", time.Now().UnixNano())
+		tname := "tmp." + fn + strconv.FormatInt(time.Now().UnixNano(), 10)
 		s.mftmp = filepath.Join(s.outdir, tname)
 		s.mf, err = os.Create(s.mftmp)
 		if err != nil {
@@ -613,7 +614,7 @@ func (s *emitState) VisitFuncs(f encodecounter.CounterVisitorFn) error {
 // is also used to capture GOOS + GOARCH values as well.
 func captureOsArgs() map[string]string {
 	m := make(map[string]string)
-	m["argc"] = fmt.Sprintf("%d", len(os.Args))
+	m["argc"] = strconv.Itoa(len(os.Args))
 	for k, a := range os.Args {
 		m[fmt.Sprintf("argv%d", k)] = a
 	}
