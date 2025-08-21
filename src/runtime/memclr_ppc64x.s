@@ -19,7 +19,7 @@ check:
 	SRD   $3, R4, R6  // R6: double words to clear
 	CMP   R6, $0, CR1 // CR1[EQ] set if no double words
 
-	BC    12, 6, nozerolarge // only single bytes
+	BEQ   CR1, nozerolarge // only single bytes
 	CMP   R4, $512
 	BLT   under512           // special case for < 512
 	ANDCC $127, R3, R8       // check for 128 alignment of address
@@ -104,18 +104,28 @@ lt16gt8:
 #endif
 nozerolarge:
 	ANDCC $7, R4, R5 // any remaining bytes
-	BC    4, 1, LR   // ble lr
+	BLE    CR0, LR   // ble lr
 #ifdef GOPPC64_power10
 	XXLXOR  VS32, VS32, VS32 // clear VS32 (V0)
 	SLD	$56, R5, R7
 	STXVL   V0, R3, R7
 	RET
 #else
-	MOVD R5, CTR // set up to clear tail bytes
-zerotailloop:
-	MOVB R0, 0(R3)           // clear single bytes
-	ADD  $1, R3
-	BDNZ zerotailloop // dec ctr, br zerotailloop if ctr not 0
+	CMP   R5, $4
+	BLT   next2
+	MOVW  R0, 0(R3)
+	ADD   $4, R3
+	ADD   $-4, R5
+next2:
+	CMP   R5, $2
+	BLT   next1
+	MOVH  R0, 0(R3)
+	ADD   $2, R3
+	ADD   $-2, R5
+next1:
+	CMP   R5, $0
+	BEQ   CR0, LR      // beqlr
+	MOVB  R0, 0(R3)
 	RET
 #endif
 
@@ -149,7 +159,7 @@ zero512setup:  // setup for dcbz loop
 	MOVD $128, R9   // index regs for 128 bytes
 	MOVD $256, R10
 	MOVD $384, R11
-	PCALIGN $32
+	PCALIGN $16
 zero512:
 	DCBZ (R3+R0)        // clear first chunk
 	DCBZ (R3+R9)        // clear second chunk

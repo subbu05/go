@@ -7,6 +7,7 @@ package ir
 import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
 	"go/constant"
 )
@@ -23,7 +24,7 @@ func NewDecl(pos src.XPos, op Op, x *Name) *Decl {
 	switch op {
 	default:
 		panic("invalid Decl op " + op.String())
-	case ODCL, ODCLCONST, ODCLTYPE:
+	case ODCL:
 		n.op = op
 	}
 	return n
@@ -220,7 +221,6 @@ type ForStmt struct {
 	Cond         Node
 	Post         Node
 	Body         Nodes
-	HasBreak     bool
 	DistinctVars bool
 }
 
@@ -243,7 +243,8 @@ func NewForStmt(pos src.XPos, init Node, cond, post Node, body []Node, distinctV
 // in a different context (a separate goroutine or a later time).
 type GoDeferStmt struct {
 	miniStmt
-	Call Node
+	Call    Node
+	DeferAt Expr
 }
 
 func NewGoDeferStmt(pos src.XPos, op Op, call Node) *GoDeferStmt {
@@ -286,7 +287,7 @@ func NewIfStmt(pos src.XPos, cond Node, body, els []Node) *IfStmt {
 //
 // Note that a JumpTableStmt is more like a multiway-goto than
 // a multiway-if. In particular, the case bodies are just
-// labels to jump to, not not full Nodes lists.
+// labels to jump to, not full Nodes lists.
 type JumpTableStmt struct {
 	miniStmt
 
@@ -306,6 +307,46 @@ func NewJumpTableStmt(pos src.XPos, idx Node) *JumpTableStmt {
 	n := &JumpTableStmt{Idx: idx}
 	n.pos = pos
 	n.op = OJUMPTABLE
+	return n
+}
+
+// An InterfaceSwitchStmt is used to implement type switches.
+// Its semantics are:
+//
+//	if RuntimeType implements Descriptor.Cases[0] {
+//	    Case, Itab = 0, itab<RuntimeType, Descriptor.Cases[0]>
+//	} else if RuntimeType implements Descriptor.Cases[1] {
+//	    Case, Itab = 1, itab<RuntimeType, Descriptor.Cases[1]>
+//	...
+//	} else if RuntimeType implements Descriptor.Cases[N-1] {
+//	    Case, Itab = N-1, itab<RuntimeType, Descriptor.Cases[N-1]>
+//	} else {
+//	    Case, Itab = len(cases), nil
+//	}
+//
+// RuntimeType must be a non-nil *runtime._type.
+// Hash must be the hash field of RuntimeType (or its copy loaded from an itab).
+// Descriptor must represent an abi.InterfaceSwitch global variable.
+type InterfaceSwitchStmt struct {
+	miniStmt
+
+	Case        Node
+	Itab        Node
+	RuntimeType Node
+	Hash        Node
+	Descriptor  *obj.LSym
+}
+
+func NewInterfaceSwitchStmt(pos src.XPos, case_, itab, runtimeType, hash Node, descriptor *obj.LSym) *InterfaceSwitchStmt {
+	n := &InterfaceSwitchStmt{
+		Case:        case_,
+		Itab:        itab,
+		RuntimeType: runtimeType,
+		Hash:        hash,
+		Descriptor:  descriptor,
+	}
+	n.pos = pos
+	n.op = OINTERFACESWITCH
 	return n
 }
 
@@ -350,7 +391,6 @@ type RangeStmt struct {
 	Key          Node
 	Value        Node
 	Body         Nodes
-	HasBreak     bool
 	DistinctVars bool
 	Prealloc     *Name
 
@@ -375,15 +415,13 @@ func NewRangeStmt(pos src.XPos, key, value, x Node, body []Node, distinctVars bo
 // A ReturnStmt is a return statement.
 type ReturnStmt struct {
 	miniStmt
-	origNode       // for typecheckargs rewrite
-	Results  Nodes // return list
+	Results Nodes // return list
 }
 
 func NewReturnStmt(pos src.XPos, results []Node) *ReturnStmt {
 	n := &ReturnStmt{}
 	n.pos = pos
 	n.op = ORETURN
-	n.orig = n
 	n.Results = results
 	return n
 }
@@ -391,9 +429,8 @@ func NewReturnStmt(pos src.XPos, results []Node) *ReturnStmt {
 // A SelectStmt is a block: { Cases }.
 type SelectStmt struct {
 	miniStmt
-	Label    *types.Sym
-	Cases    []*CommClause
-	HasBreak bool
+	Label *types.Sym
+	Cases []*CommClause
 
 	// TODO(rsc): Instead of recording here, replace with a block?
 	Compiled Nodes // compiled form, after walkSelect
@@ -423,10 +460,9 @@ func NewSendStmt(pos src.XPos, ch, value Node) *SendStmt {
 // A SwitchStmt is a switch statement: switch Init; Tag { Cases }.
 type SwitchStmt struct {
 	miniStmt
-	Tag      Node
-	Cases    []*CaseClause
-	Label    *types.Sym
-	HasBreak bool
+	Tag   Node
+	Cases []*CaseClause
+	Label *types.Sym
 
 	// TODO(rsc): Instead of recording here, replace with a block?
 	Compiled Nodes // compiled form, after walkSwitch

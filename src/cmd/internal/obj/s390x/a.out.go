@@ -189,6 +189,7 @@ const (
 	USETMP // generated code of this Prog uses REGTMP
 )
 
+//go:generate go run ../mkcnames.go -i a.out.go -o anamesz.go -p s390x
 const ( // comments from func aclass in asmz.go
 	C_NONE     = iota
 	C_REG      // general-purpose register (64-bit)
@@ -328,6 +329,7 @@ const (
 	AFNABS
 	AFNEG
 	AFNEGS
+	ALCDBR
 	ALEDBR
 	ALDEBR
 	ALPDFR
@@ -442,6 +444,7 @@ const (
 	// storage-and-storage
 	AMVC
 	AMVCIN
+	AMVCLE
 	ACLC
 	AXC
 	AOC
@@ -479,6 +482,15 @@ const (
 
 	// macros
 	ACLEAR
+
+	// crypto
+	AKM
+	AKMC
+	AKLMD
+	AKIMD
+	AKDSA
+	AKMA
+	AKMCTR
 
 	// vector
 	AVA
@@ -703,6 +715,14 @@ const (
 	AWFLNDB
 	AVFLPDB
 	AWFLPDB
+	AVFMAXDB
+	AWFMAXDB
+	AVFMAXSB
+	AWFMAXSB
+	AVFMINDB
+	AWFMINDB
+	AVFMINSB
+	AWFMINSB
 	AVFSQ
 	AVFSQDB
 	AWFSQDB

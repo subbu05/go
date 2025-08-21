@@ -37,6 +37,9 @@
 (Mod8 x y) => (Select0 (DIV (SignExt8to32 x) (SignExt8to32 y)))
 (Mod8u x y) => (Select0 (DIVU (ZeroExt8to32 x) (ZeroExt8to32 y)))
 
+// math package intrinsics
+(Abs ...) => (ABSD ...)
+
 // (x + y) / 2 with x>=y  becomes  (x - y) / 2 + y
 (Avg32u <t> x y) => (ADD (SRLconst <t> (SUB <t> x y) [1]) y)
 
@@ -123,15 +126,17 @@
 (Sqrt ...) => (SQRTD ...)
 (Sqrt32 ...) => (SQRTF ...)
 
-// TODO: optimize this case?
-(Ctz32NonZero ...) => (Ctz32 ...)
+(Ctz(32|16|8)NonZero ...) => (Ctz32 ...)
 
 // count trailing zero
 // 32 - CLZ(x&-x - 1)
 (Ctz32 <t> x) => (SUB (MOVWconst [32]) (CLZ <t> (SUBconst <t> [1] (AND <t> x (NEG <t> x)))))
+(Ctz16 x) => (Ctz32 (Or32 <typ.UInt32> x (MOVWconst [1<<16])))
+(Ctz8  x) => (Ctz32 (Or32 <typ.UInt32> x (MOVWconst [1<<8])))
 
 // bit length
 (BitLen32 <t> x) => (SUB (MOVWconst [32]) (CLZ <t> x))
+(BitLen(16|8) x) => (BitLen32 (ZeroExt(16|8)to32 x))
 
 // boolean ops -- booleans are represented with 0=false, 1=true
 (AndB ...) => (AND ...)
@@ -215,10 +220,10 @@
 
 // loads
 (Load <t> ptr mem) && t.IsBoolean() => (MOVBUload ptr mem)
-(Load <t> ptr mem) && (is8BitInt(t) && isSigned(t)) => (MOVBload ptr mem)
-(Load <t> ptr mem) && (is8BitInt(t) && !isSigned(t)) => (MOVBUload ptr mem)
-(Load <t> ptr mem) && (is16BitInt(t) && isSigned(t)) => (MOVHload ptr mem)
-(Load <t> ptr mem) && (is16BitInt(t) && !isSigned(t)) => (MOVHUload ptr mem)
+(Load <t> ptr mem) && (is8BitInt(t)  &&  t.IsSigned()) => (MOVBload ptr mem)
+(Load <t> ptr mem) && (is8BitInt(t)  && !t.IsSigned()) => (MOVBUload ptr mem)
+(Load <t> ptr mem) && (is16BitInt(t) &&  t.IsSigned()) => (MOVHload ptr mem)
+(Load <t> ptr mem) && (is16BitInt(t) && !t.IsSigned()) => (MOVHUload ptr mem)
 (Load <t> ptr mem) && (is32BitInt(t) || isPtr(t)) => (MOVWload ptr mem)
 (Load <t> ptr mem) && is32BitFloat(t) => (MOVFload ptr mem)
 (Load <t> ptr mem) && is64BitFloat(t) => (MOVDload ptr mem)
@@ -226,9 +231,18 @@
 // stores
 (Store {t} ptr val mem) && t.Size() == 1 => (MOVBstore ptr val mem)
 (Store {t} ptr val mem) && t.Size() == 2 => (MOVHstore ptr val mem)
-(Store {t} ptr val mem) && t.Size() == 4 && !is32BitFloat(val.Type) => (MOVWstore ptr val mem)
-(Store {t} ptr val mem) && t.Size() == 4 && is32BitFloat(val.Type) => (MOVFstore ptr val mem)
-(Store {t} ptr val mem) && t.Size() == 8 && is64BitFloat(val.Type) => (MOVDstore ptr val mem)
+(Store {t} ptr val mem) && t.Size() == 4 && !t.IsFloat() => (MOVWstore ptr val mem)
+(Store {t} ptr val mem) && t.Size() == 4 &&  t.IsFloat() => (MOVFstore ptr val mem)
+(Store {t} ptr val mem) && t.Size() == 8 &&  t.IsFloat() => (MOVDstore ptr val mem)
+
+// float <=> int register moves, with no conversion.
+// These come up when compiling math.{Float32bits, Float32frombits}.
+(MOVWload [off] {sym} ptr (MOVFstore [off] {sym} ptr val _)) => (MOVWfpgp val)
+(MOVFload [off] {sym} ptr (MOVWstore [off] {sym} ptr val _)) => (MOVWgpfp val)
+
+// Similarly for stores, if we see a store after FPR <=> GPR move, then redirect store to use the other register set.
+(MOVWstore [off] {sym} ptr (MOVWfpgp val) mem) => (MOVFstore [off] {sym} ptr val mem)
+(MOVFstore [off] {sym} ptr (MOVWgpfp val) mem) => (MOVWstore [off] {sym} ptr val mem)
 
 // zero instructions
 (Zero [0] _ mem) => mem
@@ -406,13 +420,20 @@
 // Write barrier.
 (WB ...) => (LoweredWB ...)
 
-(PanicBounds [kind] x y mem) && boundsABI(kind) == 0 => (LoweredPanicBoundsA [kind] x y mem)
-(PanicBounds [kind] x y mem) && boundsABI(kind) == 1 => (LoweredPanicBoundsB [kind] x y mem)
-(PanicBounds [kind] x y mem) && boundsABI(kind) == 2 => (LoweredPanicBoundsC [kind] x y mem)
+// Publication barrier as intrinsic
+(PubBarrier ...) => (LoweredPubBarrier ...)
 
-(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 0 => (LoweredPanicExtendA [kind] hi lo y mem)
-(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 1 => (LoweredPanicExtendB [kind] hi lo y mem)
-(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 2 => (LoweredPanicExtendC [kind] hi lo y mem)
+
+(PanicBounds ...) => (LoweredPanicBoundsRR ...)
+(PanicExtend ...) => (LoweredPanicExtendRR ...)
+
+(LoweredPanicBoundsRR [kind] x (MOVWconst [c]) mem) => (LoweredPanicBoundsRC [kind] x {PanicBoundsC{C:int64(c)}} mem)
+(LoweredPanicBoundsRR [kind] (MOVWconst [c]) y mem) => (LoweredPanicBoundsCR [kind] {PanicBoundsC{C:int64(c)}} y mem)
+(LoweredPanicBoundsRC [kind] {p} (MOVWconst [c]) mem) => (LoweredPanicBoundsCC [kind] {PanicBoundsCC{Cx:int64(c), Cy:p.C}} mem)
+
+(LoweredPanicExtendRR [kind] hi lo (MOVWconst [c]) mem) => (LoweredPanicExtendRC [kind] hi lo {PanicBoundsC{C:int64(c)}} mem)
+(LoweredPanicExtendRR [kind] (MOVWconst [hi]) (MOVWconst [lo]) y mem) => (LoweredPanicBoundsCR [kind] {PanicBoundsC{C:int64(hi)<<32 + int64(uint32(lo))}} y mem)
+(LoweredPanicExtendRC [kind] {p} (MOVWconst [hi]) (MOVWconst [lo]) mem) => (LoweredPanicBoundsCC [kind] {PanicBoundsCC{Cx:int64(hi)<<32+int64(uint32(lo)), Cy:p.C}} mem)
 
 // Optimizations
 
@@ -590,21 +611,24 @@
 (Select0 (MULTU (MOVWconst [1])  _ )) => (MOVWconst [0])
 (Select1 (MULTU (MOVWconst [-1]) x )) => (NEG <x.Type> x)
 (Select0 (MULTU (MOVWconst [-1]) x )) => (CMOVZ (ADDconst <x.Type> [-1] x) (MOVWconst [0]) x)
-(Select1 (MULTU (MOVWconst [c])  x )) && isPowerOfTwo64(int64(uint32(c))) => (SLLconst [int32(log2uint32(int64(c)))] x)
-(Select0 (MULTU (MOVWconst [c])  x )) && isPowerOfTwo64(int64(uint32(c))) => (SRLconst [int32(32-log2uint32(int64(c)))] x)
+(Select1 (MULTU (MOVWconst [c])  x )) && isUnsignedPowerOfTwo(uint32(c)) => (SLLconst [int32(log32u(uint32(c)))] x)
+(Select0 (MULTU (MOVWconst [c])  x )) && isUnsignedPowerOfTwo(uint32(c)) => (SRLconst [int32(32-log32u(uint32(c)))] x)
 
 (MUL (MOVWconst [0])  _ ) => (MOVWconst [0])
 (MUL (MOVWconst [1])  x ) => x
 (MUL (MOVWconst [-1]) x ) => (NEG x)
-(MUL (MOVWconst [c]) x ) && isPowerOfTwo64(int64(uint32(c))) => (SLLconst [int32(log2uint32(int64(c)))] x)
+(MUL (MOVWconst [c]) x ) && isUnsignedPowerOfTwo(uint32(c)) => (SLLconst [int32(log32u(uint32(c)))] x)
 
 // generic simplifications
 (ADD x (NEG y)) => (SUB x y)
+(SUB x (NEG y)) => (ADD x y)
 (SUB x x) => (MOVWconst [0])
 (SUB (MOVWconst [0]) x) => (NEG x)
 (AND x x) => x
 (OR  x x) => x
 (XOR x x) => (MOVWconst [0])
+(NEG (SUB x y)) => (SUB y x)
+(NEG (NEG x)) => x
 
 // miscellaneous patterns generated by dec64
 (AND (SGTUconst [1] x) (SGTUconst [1] y)) =>  (SGTUconst [1] (OR <x.Type> x y))

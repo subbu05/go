@@ -8,7 +8,7 @@ import (
 	"cmd/compile/internal/syntax"
 	"fmt"
 	"internal/testenv"
-	"sort"
+	"slices"
 	"testing"
 
 	. "cmd/compile/internal/types2"
@@ -116,8 +116,8 @@ func TestResolveIdents(t *testing.T) {
 
 	// parse package files
 	var files []*syntax.File
-	for i, src := range sources {
-		files = append(files, mustParse(fmt.Sprintf("sources[%d]", i), src))
+	for _, src := range sources {
+		files = append(files, mustParse(src))
 	}
 
 	// resolve and type-check package AST
@@ -166,7 +166,7 @@ func TestResolveIdents(t *testing.T) {
 	}
 
 	// Check that each identifier in the source is found in uses or defs or both.
-	// We need the foundUses/Defs maps (rather then just deleting the found objects
+	// We need the foundUses/Defs maps (rather than just deleting the found objects
 	// from the uses and defs maps) because syntax.Walk traverses shared nodes multiple
 	// times (e.g. types in field lists such as "a, b, c int").
 	foundUses := make(map[*syntax.Name]bool)
@@ -197,7 +197,7 @@ func TestResolveIdents(t *testing.T) {
 	}
 
 	// check the expected set of idents that are simultaneously uses and defs
-	sort.Strings(both)
+	slices.Sort(both)
 	if got, want := fmt.Sprint(both), "[Mutex Stringer error]"; got != want {
 		t.Errorf("simultaneous uses/defs = %s, want %s", got, want)
 	}

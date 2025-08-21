@@ -43,7 +43,6 @@ var (
 	modkernel32 = NewLazyDLL(sysdll.Add("kernel32.dll"))
 	modmswsock  = NewLazyDLL(sysdll.Add("mswsock.dll"))
 	modnetapi32 = NewLazyDLL(sysdll.Add("netapi32.dll"))
-	modntdll    = NewLazyDLL(sysdll.Add("ntdll.dll"))
 	modsecur32  = NewLazyDLL(sysdll.Add("secur32.dll"))
 	modshell32  = NewLazyDLL(sysdll.Add("shell32.dll"))
 	moduserenv  = NewLazyDLL(sysdll.Add("userenv.dll"))
@@ -119,6 +118,7 @@ var (
 	procGetFileAttributesW                 = modkernel32.NewProc("GetFileAttributesW")
 	procGetFileInformationByHandle         = modkernel32.NewProc("GetFileInformationByHandle")
 	procGetFileType                        = modkernel32.NewProc("GetFileType")
+	procGetFinalPathNameByHandleW          = modkernel32.NewProc("GetFinalPathNameByHandleW")
 	procGetFullPathNameW                   = modkernel32.NewProc("GetFullPathNameW")
 	procGetLastError                       = modkernel32.NewProc("GetLastError")
 	procGetLongPathNameW                   = modkernel32.NewProc("GetLongPathNameW")
@@ -134,6 +134,7 @@ var (
 	procGetVersion                         = modkernel32.NewProc("GetVersion")
 	procInitializeProcThreadAttributeList  = modkernel32.NewProc("InitializeProcThreadAttributeList")
 	procLoadLibraryW                       = modkernel32.NewProc("LoadLibraryW")
+	procLocalAlloc                         = modkernel32.NewProc("LocalAlloc")
 	procLocalFree                          = modkernel32.NewProc("LocalFree")
 	procMapViewOfFile                      = modkernel32.NewProc("MapViewOfFile")
 	procMoveFileW                          = modkernel32.NewProc("MoveFileW")
@@ -150,6 +151,7 @@ var (
 	procSetEnvironmentVariableW            = modkernel32.NewProc("SetEnvironmentVariableW")
 	procSetFileAttributesW                 = modkernel32.NewProc("SetFileAttributesW")
 	procSetFileCompletionNotificationModes = modkernel32.NewProc("SetFileCompletionNotificationModes")
+	procSetFileInformationByHandle         = modkernel32.NewProc("SetFileInformationByHandle")
 	procSetFilePointer                     = modkernel32.NewProc("SetFilePointer")
 	procSetFileTime                        = modkernel32.NewProc("SetFileTime")
 	procSetHandleInformation               = modkernel32.NewProc("SetHandleInformation")
@@ -167,7 +169,6 @@ var (
 	procNetApiBufferFree                   = modnetapi32.NewProc("NetApiBufferFree")
 	procNetGetJoinInformation              = modnetapi32.NewProc("NetGetJoinInformation")
 	procNetUserGetInfo                     = modnetapi32.NewProc("NetUserGetInfo")
-	procRtlGetNtVersionNumbers             = modntdll.NewProc("RtlGetNtVersionNumbers")
 	procGetUserNameExW                     = modsecur32.NewProc("GetUserNameExW")
 	procTranslateNameW                     = modsecur32.NewProc("TranslateNameW")
 	procCommandLineToArgvW                 = modshell32.NewProc("CommandLineToArgvW")
@@ -502,10 +503,10 @@ func CreateFileMapping(fhandle Handle, sa *SecurityAttributes, prot uint32, maxS
 	return
 }
 
-func CreateFile(name *uint16, access uint32, mode uint32, sa *SecurityAttributes, createmode uint32, attrs uint32, templatefile int32) (handle Handle, err error) {
+func createFile(name *uint16, access uint32, mode uint32, sa *SecurityAttributes, createmode uint32, attrs uint32, templatefile int32) (handle Handle, err error) {
 	r0, _, e1 := Syscall9(procCreateFileW.Addr(), 7, uintptr(unsafe.Pointer(name)), uintptr(access), uintptr(mode), uintptr(unsafe.Pointer(sa)), uintptr(createmode), uintptr(attrs), uintptr(templatefile), 0, 0)
 	handle = Handle(r0)
-	if handle == InvalidHandle {
+	if handle == InvalidHandle || e1 == ERROR_ALREADY_EXISTS {
 		err = errnoErr(e1)
 	}
 	return
@@ -779,6 +780,15 @@ func GetFileType(filehandle Handle) (n uint32, err error) {
 	return
 }
 
+func getFinalPathNameByHandle(file Handle, filePath *uint16, filePathSize uint32, flags uint32) (n uint32, err error) {
+	r0, _, e1 := Syscall6(procGetFinalPathNameByHandleW.Addr(), 4, uintptr(file), uintptr(unsafe.Pointer(filePath)), uintptr(filePathSize), uintptr(flags), 0, 0)
+	n = uint32(r0)
+	if n == 0 || n >= filePathSize {
+		err = errnoErr(e1)
+	}
+	return
+}
+
 func GetFullPathName(path *uint16, buflen uint32, buf *uint16, fname **uint16) (n uint32, err error) {
 	r0, _, e1 := Syscall6(procGetFullPathNameW.Addr(), 4, uintptr(unsafe.Pointer(path)), uintptr(buflen), uintptr(unsafe.Pointer(buf)), uintptr(unsafe.Pointer(fname)), 0, 0)
 	n = uint32(r0)
@@ -848,11 +858,8 @@ func GetShortPathName(longpath *uint16, shortpath *uint16, buflen uint32) (n uin
 	return
 }
 
-func GetStartupInfo(startupInfo *StartupInfo) (err error) {
-	r1, _, e1 := Syscall(procGetStartupInfoW.Addr(), 1, uintptr(unsafe.Pointer(startupInfo)), 0, 0)
-	if r1 == 0 {
-		err = errnoErr(e1)
-	}
+func getStartupInfo(startupInfo *StartupInfo) {
+	Syscall(procGetStartupInfoW.Addr(), 1, uintptr(unsafe.Pointer(startupInfo)), 0, 0)
 	return
 }
 
@@ -918,6 +925,15 @@ func _LoadLibrary(libname *uint16) (handle Handle, err error) {
 	r0, _, e1 := Syscall(procLoadLibraryW.Addr(), 1, uintptr(unsafe.Pointer(libname)), 0, 0)
 	handle = Handle(r0)
 	if handle == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
+func localAlloc(flags uint32, length uint32) (ptr uintptr, err error) {
+	r0, _, e1 := Syscall(procLocalAlloc.Addr(), 2, uintptr(flags), uintptr(length), 0)
+	ptr = uintptr(r0)
+	if ptr == 0 {
 		err = errnoErr(e1)
 	}
 	return
@@ -1066,6 +1082,14 @@ func SetFileCompletionNotificationModes(handle Handle, flags uint8) (err error) 
 	return
 }
 
+func setFileInformationByHandle(handle Handle, fileInformationClass uint32, buf unsafe.Pointer, bufsize uint32) (err error) {
+	r1, _, e1 := Syscall6(procSetFileInformationByHandle.Addr(), 4, uintptr(handle), uintptr(fileInformationClass), uintptr(buf), uintptr(bufsize), 0, 0)
+	if r1 == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
 func SetFilePointer(handle Handle, lowoffset int32, highoffsetptr *int32, whence uint32) (newlowoffset uint32, err error) {
 	r0, _, e1 := Syscall6(procSetFilePointer.Addr(), 4, uintptr(handle), uintptr(lowoffset), uintptr(unsafe.Pointer(highoffsetptr)), uintptr(whence), 0, 0)
 	newlowoffset = uint32(r0)
@@ -1202,11 +1226,6 @@ func NetUserGetInfo(serverName *uint16, userName *uint16, level uint32, buf **by
 	if r0 != 0 {
 		neterr = Errno(r0)
 	}
-	return
-}
-
-func rtlGetNtVersionNumbers(majorVersion *uint32, minorVersion *uint32, buildNumber *uint32) {
-	Syscall(procRtlGetNtVersionNumbers.Addr(), 3, uintptr(unsafe.Pointer(majorVersion)), uintptr(unsafe.Pointer(minorVersion)), uintptr(unsafe.Pointer(buildNumber)))
 	return
 }
 

@@ -8,7 +8,6 @@ package nettest
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -103,12 +102,12 @@ func TestableNetwork(network string) bool {
 		// This is an internal network name for testing on the
 		// package net of the standard library.
 		switch runtime.GOOS {
-		case "android", "fuchsia", "hurd", "ios", "js", "nacl", "plan9", "windows":
+		case "android", "fuchsia", "hurd", "ios", "js", "nacl", "plan9", "wasip1", "windows":
 			return false
 		}
 	case "ip", "ip4", "ip6":
 		switch runtime.GOOS {
-		case "fuchsia", "hurd", "js", "nacl", "plan9":
+		case "fuchsia", "hurd", "js", "nacl", "plan9", "wasip1":
 			return false
 		default:
 			if os.Getuid() != 0 {
@@ -117,21 +116,15 @@ func TestableNetwork(network string) bool {
 		}
 	case "unix", "unixgram":
 		switch runtime.GOOS {
-		case "android", "fuchsia", "hurd", "ios", "js", "nacl", "plan9", "windows":
+		case "android", "fuchsia", "hurd", "ios", "js", "nacl", "plan9", "wasip1", "windows":
 			return false
 		case "aix":
 			return unixStrmDgramEnabled()
 		}
 	case "unixpacket":
 		switch runtime.GOOS {
-		case "aix", "android", "fuchsia", "hurd", "darwin", "ios", "js", "nacl", "plan9", "windows", "zos":
+		case "aix", "android", "fuchsia", "hurd", "darwin", "ios", "js", "nacl", "plan9", "wasip1", "windows", "zos":
 			return false
-		case "netbsd":
-			// It passes on amd64 at least. 386 fails
-			// (Issue 22927). arm is unknown.
-			if runtime.GOARCH == "386" {
-				return false
-			}
 		}
 	}
 	switch ss[0] {
@@ -232,7 +225,7 @@ func LocalPath() (string, error) {
 	if runtime.GOOS == "darwin" {
 		dir = "/tmp"
 	}
-	f, err := ioutil.TempFile(dir, "go-nettest")
+	f, err := os.CreateTemp(dir, "go-nettest")
 	if err != nil {
 		return "", err
 	}

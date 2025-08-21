@@ -33,6 +33,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
+	"internal/abi"
 	"log"
 	"math"
 )
@@ -313,7 +314,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				autosize += int32(c.ctxt.Arch.FixedFrameSize)
 			}
 
-			if p.Mark&LEAF != 0 && autosize < objabi.StackSmall {
+			if p.Mark&LEAF != 0 && autosize < abi.StackSmall {
 				// A leaf function with a small stack can be marked
 				// NOSPLIT, avoiding a stack check.
 				p.From.Sym.Set(obj.AttrNoSplit, true)
@@ -381,96 +382,6 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 			if c.cursym.Func().Text.Mark&LEAF != 0 {
 				c.cursym.Set(obj.AttrLeaf, true)
 				break
-			}
-
-			if c.cursym.Func().Text.From.Sym.Wrapper() {
-				// if(g->panic != nil && g->panic->argp == FP) g->panic->argp = bottom-of-frame
-				//
-				//	MOVD g_panic(g), R3
-				//	CMP R3, $0
-				//	BEQ end
-				//	MOVD panic_argp(R3), R4
-				//	ADD $(autosize+8), R1, R5
-				//	CMP R4, R5
-				//	BNE end
-				//	ADD $8, R1, R6
-				//	MOVD R6, panic_argp(R3)
-				// end:
-				//	NOP
-				//
-				// The NOP is needed to give the jumps somewhere to land.
-				// It is a liblink NOP, not a s390x NOP: it encodes to 0 instruction bytes.
-
-				q = obj.Appendp(q, c.newprog)
-
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REGG
-				q.From.Offset = 4 * int64(c.ctxt.Arch.PtrSize) // G.panic
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R3
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ACMP
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R3
-				q.To.Type = obj.TYPE_CONST
-				q.To.Offset = 0
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ABEQ
-				q.To.Type = obj.TYPE_BRANCH
-				p1 := q
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REG_R3
-				q.From.Offset = 0 // Panic.argp
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R4
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AADD
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = int64(autosize) + c.ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R5
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ACMP
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R4
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R5
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = ABNE
-				q.To.Type = obj.TYPE_BRANCH
-				p2 := q
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AADD
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = c.ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R6
-
-				q = obj.Appendp(q, c.newprog)
-				q.As = AMOVD
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R6
-				q.To.Type = obj.TYPE_MEM
-				q.To.Reg = REG_R3
-				q.To.Offset = 0 // Panic.argp
-
-				q = obj.Appendp(q, c.newprog)
-
-				q.As = obj.ANOP
-				p1.To.SetTarget(q)
-				p2.To.SetTarget(q)
 			}
 
 		case obj.ARET:
@@ -568,8 +479,8 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 
 		if p.To.Type == obj.TYPE_REG && p.To.Reg == REGSP && p.Spadj == 0 {
 			f := c.cursym.Func()
-			if f.FuncFlag&objabi.FuncFlag_SPWRITE == 0 {
-				c.cursym.Func().FuncFlag |= objabi.FuncFlag_SPWRITE
+			if f.FuncFlag&abi.FuncFlagSPWrite == 0 {
+				c.cursym.Func().FuncFlag |= abi.FuncFlagSPWrite
 				if ctxt.Debugvlog || !ctxt.IsAsm {
 					ctxt.Logf("auto-SPWRITE: %s\n", c.cursym.Name)
 					if !ctxt.IsAsm {
@@ -662,7 +573,7 @@ func (c *ctxtz) stacksplitPre(p *obj.Prog, framesize int32) (pPre, pPreempt, pCh
 	// unnecessarily. See issue #35470.
 	p = c.ctxt.StartUnsafePoint(p, c.newprog)
 
-	if framesize <= objabi.StackSmall {
+	if framesize <= abi.StackSmall {
 		// small stack: SP < stackguard
 		//	CMPUBGE	stackguard, SP, label-of-call-to-morestack
 
@@ -678,8 +589,8 @@ func (c *ctxtz) stacksplitPre(p *obj.Prog, framesize int32) (pPre, pPreempt, pCh
 
 	// large stack: SP-framesize < stackguard-StackSmall
 
-	offset := int64(framesize) - objabi.StackSmall
-	if framesize > objabi.StackBig {
+	offset := int64(framesize) - abi.StackSmall
+	if framesize > abi.StackBig {
 		// Such a large stack we need to protect against underflow.
 		// The runtime guarantees SP > objabi.StackBig, but
 		// framesize is large enough that SP-framesize may

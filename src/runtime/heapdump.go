@@ -12,13 +12,15 @@
 package runtime
 
 import (
+	"internal/abi"
 	"internal/goarch"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
 //go:linkname runtime_debug_WriteHeapDump runtime/debug.WriteHeapDump
 func runtime_debug_WriteHeapDump(fd uintptr) {
-	stopTheWorld("write heap dump")
+	stw := stopTheWorld(stwWriteHeapDump)
 
 	// Keep m on this G's stack instead of the system stack.
 	// Both readmemstats_m and writeheapdump_m have pretty large
@@ -35,7 +37,7 @@ func runtime_debug_WriteHeapDump(fd uintptr) {
 		writeheapdump_m(fd, &m)
 	})
 
-	startTheWorld()
+	startTheWorld(stw)
 }
 
 const (
@@ -167,7 +169,7 @@ func dumptype(t *_type) {
 
 	// If we've definitely serialized the type before,
 	// no need to do it again.
-	b := &typecache[t.hash&(typeCacheBuckets-1)]
+	b := &typecache[t.Hash&(typeCacheBuckets-1)]
 	if t == b.t[0] {
 		return
 	}
@@ -192,18 +194,19 @@ func dumptype(t *_type) {
 	// dump the type
 	dumpint(tagType)
 	dumpint(uint64(uintptr(unsafe.Pointer(t))))
-	dumpint(uint64(t.size))
-	if x := t.uncommon(); x == nil || t.nameOff(x.pkgpath).name() == "" {
-		dumpstr(t.string())
+	dumpint(uint64(t.Size_))
+	rt := toRType(t)
+	if x := t.Uncommon(); x == nil || rt.nameOff(x.PkgPath).Name() == "" {
+		dumpstr(rt.string())
 	} else {
-		pkgpath := t.nameOff(x.pkgpath).name()
-		name := t.name()
+		pkgpath := rt.nameOff(x.PkgPath).Name()
+		name := rt.name()
 		dumpint(uint64(uintptr(len(pkgpath)) + 1 + uintptr(len(name))))
 		dwrite(unsafe.Pointer(unsafe.StringData(pkgpath)), uintptr(len(pkgpath)))
 		dwritebyte('.')
 		dwrite(unsafe.Pointer(unsafe.StringData(name)), uintptr(len(name)))
 	}
-	dumpbool(t.kind&kindDirectIface == 0 || t.ptrdata != 0)
+	dumpbool(!t.IsDirectIface() || t.Pointers())
 }
 
 // dump an object.
@@ -257,7 +260,7 @@ func dumpframe(s *stkframe, child *childInfo) {
 	pcdata := int32(-1) // Use the entry map at function entry
 	if pc != f.entry() {
 		pc--
-		pcdata = pcdatavalue(f, _PCDATA_StackMapIndex, pc, nil)
+		pcdata = pcdatavalue(f, abi.PCDATA_StackMapIndex, pc)
 	}
 	if pcdata == -1 {
 		// We do not have a valid pcdata value but there might be a
@@ -265,7 +268,7 @@ func dumpframe(s *stkframe, child *childInfo) {
 		// at the function prologue, assume so and hope for the best.
 		pcdata = 0
 	}
-	stkmap := (*stackmap)(funcdata(f, _FUNCDATA_LocalsPointerMaps))
+	stkmap := (*stackmap)(funcdata(f, abi.FUNCDATA_LocalsPointerMaps))
 
 	var bv bitvector
 	if stkmap != nil && stkmap.n > 0 {
@@ -326,7 +329,7 @@ func dumpframe(s *stkframe, child *childInfo) {
 	child.arglen = s.argBytes()
 	child.sp = (*uint8)(unsafe.Pointer(s.sp))
 	child.depth++
-	stkmap = (*stackmap)(funcdata(f, _FUNCDATA_ArgsPointerMaps))
+	stkmap = (*stackmap)(funcdata(f, abi.FUNCDATA_ArgsPointerMaps))
 	if stkmap != nil {
 		child.args = stackmapdata(stkmap, pcdata)
 	} else {
@@ -396,7 +399,7 @@ func dumpgoroutine(gp *g) {
 		dumpint(uint64(uintptr(unsafe.Pointer(gp))))
 		eface := efaceOf(&p.arg)
 		dumpint(uint64(uintptr(unsafe.Pointer(eface._type))))
-		dumpint(uint64(uintptr(unsafe.Pointer(eface.data))))
+		dumpint(uint64(uintptr(eface.data)))
 		dumpint(0) // was p->defer, no longer recorded
 		dumpint(uint64(uintptr(unsafe.Pointer(p.link))))
 	}
@@ -457,7 +460,7 @@ func dumproots() {
 					continue
 				}
 				spf := (*specialfinalizer)(unsafe.Pointer(sp))
-				p := unsafe.Pointer(s.base() + uintptr(spf.special.offset))
+				p := unsafe.Pointer(s.base() + spf.special.offset)
 				dumpfinalizer(p, spf.fn, spf.fint, spf.ot)
 			}
 		}
@@ -469,7 +472,7 @@ func dumproots() {
 
 // Bit vector of free marks.
 // Needs to be as big as the largest number of objects per span.
-var freemark [_PageSize / 8]bool
+var freemark [pageSize / 8]bool
 
 func dumpobjs() {
 	// To protect mheap_.allspans.
@@ -481,13 +484,13 @@ func dumpobjs() {
 		}
 		p := s.base()
 		size := s.elemsize
-		n := (s.npages << _PageShift) / size
+		n := (s.npages << gc.PageShift) / size
 		if n > uintptr(len(freemark)) {
 			throw("freemark array doesn't have enough entries")
 		}
 
-		for freeIndex := uintptr(0); freeIndex < s.nelems; freeIndex++ {
-			if s.isFree(freeIndex) {
+		for freeIndex := uint16(0); freeIndex < s.nelems; freeIndex++ {
+			if s.isFree(uintptr(freeIndex)) {
 				freemark[freeIndex] = true
 			}
 		}
@@ -533,11 +536,11 @@ func dumpparams() {
 	dumpint(uint64(arenaEnd))
 	dumpstr(goarch.GOARCH)
 	dumpstr(buildVersion)
-	dumpint(uint64(ncpu))
+	dumpint(uint64(numCPUStartup))
 }
 
 func itab_callback(tab *itab) {
-	t := tab._type
+	t := tab.Type
 	dumptype(t)
 	dumpint(tagItab)
 	dumpint(uint64(uintptr(unsafe.Pointer(tab))))
@@ -656,7 +659,7 @@ func dumpmemprof() {
 				continue
 			}
 			spp := (*specialprofile)(unsafe.Pointer(sp))
-			p := s.base() + uintptr(spp.special.offset)
+			p := s.base() + spp.special.offset
 			dumpint(tagAllocSample)
 			dumpint(uint64(p))
 			dumpint(uint64(uintptr(unsafe.Pointer(spp.b))))
@@ -725,22 +728,19 @@ func makeheapobjbv(p uintptr, size uintptr) bitvector {
 			sysFree(unsafe.Pointer(&tmpbuf[0]), uintptr(len(tmpbuf)), &memstats.other_sys)
 		}
 		n := nptr/8 + 1
-		p := sysAlloc(n, &memstats.other_sys)
+		p := sysAlloc(n, &memstats.other_sys, "heapdump")
 		if p == nil {
 			throw("heapdump: out of memory")
 		}
 		tmpbuf = (*[1 << 30]byte)(p)[:n]
 	}
 	// Convert heap bitmap to pointer bitmap.
-	for i := uintptr(0); i < nptr/8+1; i++ {
-		tmpbuf[i] = 0
-	}
-
-	hbits := heapBitsForAddr(p, size)
+	clear(tmpbuf[:nptr/8+1])
+	s := spanOf(p)
+	tp := s.typePointersOf(p, size)
 	for {
 		var addr uintptr
-		hbits, addr = hbits.next()
-		if addr == 0 {
+		if tp, addr = tp.next(p + size); addr == 0 {
 			break
 		}
 		i := (addr - p) / goarch.PtrSize

@@ -9,11 +9,11 @@ package types_test
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
+	"go/parser"
 	"go/token"
 	"internal/testenv"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,7 +21,7 @@ import (
 )
 
 func TestIssue5770(t *testing.T) {
-	_, err := typecheck("p", `package p; type S struct{T}`, nil, nil)
+	_, err := typecheck(`package p; type S struct{T}`, nil, nil)
 	const want = "undefined: T"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("got: %v; want: %s", err, want)
@@ -41,7 +41,7 @@ var (
 	_ = (interface{})(nil)
 )`
 	types := make(map[ast.Expr]TypeAndValue)
-	mustTypecheck("p", src, nil, &Info{Types: types})
+	mustTypecheck(src, nil, &Info{Types: types})
 
 	for x, tv := range types {
 		var want Type
@@ -80,7 +80,7 @@ func f() int {
 }
 `
 	types := make(map[ast.Expr]TypeAndValue)
-	mustTypecheck("p", src, nil, &Info{Types: types})
+	mustTypecheck(src, nil, &Info{Types: types})
 
 	want := Typ[Int]
 	n := 0
@@ -104,7 +104,7 @@ package p
 func (T) m() (res bool) { return }
 type T struct{} // receiver type after method declaration
 `
-	f := mustParse(fset, "", src)
+	f := mustParse(fset, src)
 
 	var conf Config
 	defs := make(map[*ast.Ident]Object)
@@ -114,7 +114,7 @@ type T struct{} // receiver type after method declaration
 	}
 
 	m := f.Decls[0].(*ast.FuncDecl)
-	res1 := defs[m.Name].(*Func).Type().(*Signature).Results().At(0)
+	res1 := defs[m.Name].(*Func).Signature().Results().At(0)
 	res2 := defs[m.Type.Results.List[0].Names[0]].(*Var)
 
 	if res1 != res2 {
@@ -138,7 +138,7 @@ func _() {
 	// We need a specific fileset in this test below for positions.
 	// Cannot use typecheck helper.
 	fset := token.NewFileSet()
-	f := mustParse(fset, "", src)
+	f := mustParse(fset, src)
 
 	const want = `L3 defs func p._()
 L4 defs const w untyped int
@@ -171,7 +171,7 @@ L7 uses var z int`
 		fact := fmt.Sprintf("L%d uses %s", fset.Position(id.Pos()).Line, obj)
 		facts = append(facts, fact)
 	}
-	sort.Strings(facts)
+	slices.Sort(facts)
 
 	got := strings.Join(facts, "\n")
 	if got != want {
@@ -235,7 +235,7 @@ func main() {
 `
 	f := func(test, src string) {
 		info := &Info{Uses: make(map[*ast.Ident]Object)}
-		mustTypecheck("main", src, nil, info)
+		mustTypecheck(src, nil, info)
 
 		var pkg *Package
 		count := 0
@@ -263,14 +263,13 @@ func TestIssue22525(t *testing.T) {
 
 	got := "\n"
 	conf := Config{Error: func(err error) { got += err.Error() + "\n" }}
-	typecheck("", src, &conf, nil) // do not crash
-	want := `
-1:27: a declared and not used
-1:30: b declared and not used
-1:33: c declared and not used
-1:36: d declared and not used
-1:39: e declared and not used
-`
+	typecheck(src, &conf, nil) // do not crash
+	want := "\n" +
+		"p:1:27: declared and not used: a\n" +
+		"p:1:30: declared and not used: b\n" +
+		"p:1:33: declared and not used: c\n" +
+		"p:1:36: declared and not used: d\n" +
+		"p:1:39: declared and not used: e\n"
 	if got != want {
 		t.Errorf("got: %swant: %s", got, want)
 	}
@@ -289,9 +288,9 @@ func TestIssue25627(t *testing.T) {
 		`struct { *I }`,
 		`struct { a int; b Missing; *Missing }`,
 	} {
-		f := mustParse(fset, "", prefix+src)
+		f := mustParse(fset, prefix+src)
 
-		cfg := Config{Importer: importer.Default(), Error: func(err error) {}}
+		cfg := Config{Importer: defaultImporter(fset), Error: func(err error) {}}
 		info := &Info{Types: make(map[ast.Expr]TypeAndValue)}
 		_, err := cfg.Check(f.Name.Name, fset, []*ast.File{f}, info)
 		if err != nil {
@@ -326,7 +325,7 @@ func TestIssue28005(t *testing.T) {
 	// compute original file ASTs
 	var orig [len(sources)]*ast.File
 	for i, src := range sources {
-		orig[i] = mustParse(fset, "", src)
+		orig[i] = mustParse(fset, src)
 	}
 
 	// run the test for all order permutations of the incoming files
@@ -369,7 +368,7 @@ func TestIssue28005(t *testing.T) {
 		// must match the method's name per the choice in the source file.
 		for i := 0; i < iface.NumMethods(); i++ {
 			m := iface.Method(i)
-			recvName := m.Type().(*Signature).Recv().Type().(*Named).Obj().Name()
+			recvName := m.Signature().Recv().Type().(*Named).Obj().Name()
 			if recvName != m.Name() {
 				t.Errorf("perm %v: got recv %s; want %s", perm, recvName, m.Name())
 			}
@@ -400,8 +399,8 @@ func TestIssue28282(t *testing.T) {
 }
 
 func TestIssue29029(t *testing.T) {
-	f1 := mustParse(fset, "", `package p; type A interface { M() }`)
-	f2 := mustParse(fset, "", `package p; var B interface { A }`)
+	f1 := mustParse(fset, `package p; type A interface { M() }`)
+	f2 := mustParse(fset, `package p; var B interface { A }`)
 
 	// printInfo prints the *Func definitions recorded in info, one *Func per line.
 	printInfo := func(info *Info) string {
@@ -447,10 +446,10 @@ func TestIssue34151(t *testing.T) {
 	const asrc = `package a; type I interface{ M() }; type T struct { F interface { I } }`
 	const bsrc = `package b; import "a"; type T struct { F interface { a.I } }; var _ = a.T(T{})`
 
-	a := mustTypecheck("a", asrc, nil, nil)
+	a := mustTypecheck(asrc, nil, nil)
 
 	conf := Config{Importer: importHelper{pkg: a}}
-	mustTypecheck("b", bsrc, &conf, nil)
+	mustTypecheck(bsrc, &conf, nil)
 }
 
 type importHelper struct {
@@ -488,13 +487,8 @@ func TestIssue34921(t *testing.T) {
 
 	var pkg *Package
 	for _, src := range sources {
-		f := mustParse(fset, "", src)
 		conf := Config{Importer: importHelper{pkg: pkg}}
-		res, err := conf.Check(f.Name.Name, fset, []*ast.File{f}, nil)
-		if err != nil {
-			t.Errorf("%q failed to typecheck: %v", src, err)
-		}
-		pkg = res // res is imported by the next package in this test
+		pkg = mustTypecheck(src, &conf, nil) // pkg imported by the next package in this test
 	}
 }
 
@@ -599,16 +593,24 @@ var _ T = template /* ERRORx "cannot use.*text/template.* as T value" */.Templat
 `
 	)
 
-	a := mustTypecheck("a", asrc, nil, nil)
-	imp := importHelper{pkg: a, fallback: importer.Default()}
+	a := mustTypecheck(asrc, nil, nil)
+	imp := importHelper{
+		pkg: a,
+		// TODO(adonovan): use same FileSet as mustTypecheck.
+		fallback: defaultImporter(token.NewFileSet()),
+	}
 
-	testFiles(t, nil, []string{"b.go"}, [][]byte{[]byte(bsrc)}, false, imp)
-	testFiles(t, nil, []string{"c.go"}, [][]byte{[]byte(csrc)}, false, imp)
-	testFiles(t, nil, []string{"t.go"}, [][]byte{[]byte(tsrc)}, false, imp)
+	withImporter := func(cfg *Config) {
+		cfg.Importer = imp
+	}
+
+	testFiles(t, []string{"b.go"}, [][]byte{[]byte(bsrc)}, false, withImporter)
+	testFiles(t, []string{"c.go"}, [][]byte{[]byte(csrc)}, false, withImporter)
+	testFiles(t, []string{"t.go"}, [][]byte{[]byte(tsrc)}, false, withImporter)
 }
 
 func TestIssue50646(t *testing.T) {
-	anyType := Universe.Lookup("any").Type()
+	anyType := Universe.Lookup("any").Type().Underlying()
 	comparableType := Universe.Lookup("comparable").Type()
 
 	if !Comparable(anyType) {
@@ -635,38 +637,62 @@ func TestIssue50646(t *testing.T) {
 
 func TestIssue55030(t *testing.T) {
 	// makeSig makes the signature func(typ...)
-	makeSig := func(typ Type) {
-		par := NewVar(nopos, nil, "", typ)
+	// If valid is not set, making that signature is expected to panic.
+	makeSig := func(typ Type, valid bool) {
+		if !valid {
+			defer func() {
+				if recover() == nil {
+					panic("NewSignatureType panic expected")
+				}
+			}()
+		}
+		par := NewParam(nopos, nil, "", typ)
 		params := NewTuple(par)
 		NewSignatureType(nil, nil, nil, params, nil, true)
 	}
 
 	// makeSig must not panic for the following (example) types:
 	// []int
-	makeSig(NewSlice(Typ[Int]))
+	makeSig(NewSlice(Typ[Int]), true)
 
 	// string
-	makeSig(Typ[String])
+	makeSig(Typ[String], true)
 
-	// P where P's core type is string
+	// P where P's common underlying type is string
 	{
 		P := NewTypeName(nopos, nil, "P", nil) // [P string]
-		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{Typ[String]})))
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{Typ[String]})), true)
 	}
 
-	// P where P's core type is an (unnamed) slice
+	// P where P's common underlying type is an (unnamed) slice
 	{
 		P := NewTypeName(nopos, nil, "P", nil) // [P []int]
-		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{NewSlice(Typ[Int])})))
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{NewSlice(Typ[Int])})), true)
 	}
 
-	// P where P's core type is bytestring (i.e., string or []byte)
+	// P where P's type set contains strings and []byte
 	{
 		t1 := NewTerm(true, Typ[String])          // ~string
 		t2 := NewTerm(false, NewSlice(Typ[Byte])) // []byte
 		u := NewUnion([]*Term{t1, t2})            // ~string | []byte
 		P := NewTypeName(nopos, nil, "P", nil)    // [P ~string | []byte]
-		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{u})))
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{u})), true)
+	}
+
+	// makeSig must panic for the following (example) types:
+	// int
+	makeSig(Typ[Int], false)
+
+	// P where P's type set doesn't have any specific types
+	{
+		P := NewTypeName(nopos, nil, "P", nil) // [P any]
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{Universe.Lookup("any").Type()})), false)
+	}
+
+	// P where P's type set doesn't have any slice or string types
+	{
+		P := NewTypeName(nopos, nil, "P", nil) // [P any]
+		makeSig(NewTypeParam(P, NewInterfaceType(nil, []Type{Typ[Int]})), false)
 	}
 }
 
@@ -696,7 +722,7 @@ func TestIssue51093(t *testing.T) {
 	for _, test := range tests {
 		src := fmt.Sprintf("package p; func _[P %s]() { _ = P(%s) }", test.typ, test.val)
 		types := make(map[ast.Expr]TypeAndValue)
-		mustTypecheck("p", src, nil, &Info{Types: types})
+		mustTypecheck(src, nil, &Info{Types: types})
 
 		var n int
 		for x, tv := range types {
@@ -738,7 +764,7 @@ var _ I0 = b.S{}
 type S struct{}
 func (S) M0(struct{ f string }) {}
 `,
-			`6:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I0 value in variable declaration: b[.]S does not implement I0 [(]wrong type for method M0[)]
+			`6:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I0 value in variable declaration: b[.]S does not implement I0 [(]wrong type for method M0[)]
 .*have M0[(]struct{f string /[*] package b [*]/ }[)]
 .*want M0[(]struct{f string /[*] package main [*]/ }[)]`},
 
@@ -754,7 +780,7 @@ var _ I1 = b.S{}
 type S struct{}
 func (S) M1(struct{ string }) {}
 `,
-			`6:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I1 value in variable declaration: b[.]S does not implement I1 [(]wrong type for method M1[)]
+			`6:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I1 value in variable declaration: b[.]S does not implement I1 [(]wrong type for method M1[)]
 .*have M1[(]struct{string /[*] package b [*]/ }[)]
 .*want M1[(]struct{string /[*] package main [*]/ }[)]`},
 
@@ -770,7 +796,7 @@ var _ I2 = b.S{}
 type S struct{}
 func (S) M2(struct{ f struct{ f string } }) {}
 `,
-			`6:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I2 value in variable declaration: b[.]S does not implement I2 [(]wrong type for method M2[)]
+			`6:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I2 value in variable declaration: b[.]S does not implement I2 [(]wrong type for method M2[)]
 .*have M2[(]struct{f struct{f string} /[*] package b [*]/ }[)]
 .*want M2[(]struct{f struct{f string} /[*] package main [*]/ }[)]`},
 
@@ -786,7 +812,7 @@ var _ I3 = b.S{}
 type S struct{}
 func (S) M3(struct{ F struct{ f string } }) {}
 `,
-			`6:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I3 value in variable declaration: b[.]S does not implement I3 [(]wrong type for method M3[)]
+			`6:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I3 value in variable declaration: b[.]S does not implement I3 [(]wrong type for method M3[)]
 .*have M3[(]struct{F struct{f string /[*] package b [*]/ }}[)]
 .*want M3[(]struct{F struct{f string /[*] package main [*]/ }}[)]`},
 
@@ -802,7 +828,7 @@ var _ I4 = b.S{}
 type S struct{}
 func (S) M4(struct { *string }) {}
 `,
-			`6:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I4 value in variable declaration: b[.]S does not implement I4 [(]wrong type for method M4[)]
+			`6:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I4 value in variable declaration: b[.]S does not implement I4 [(]wrong type for method M4[)]
 .*have M4[(]struct{[*]string /[*] package b [*]/ }[)]
 .*want M4[(]struct{[*]string /[*] package main [*]/ }[)]`},
 
@@ -820,7 +846,7 @@ type S struct{}
 type t struct{ A int }
 func (S) M5(struct {S;t}) {}
 `,
-			`7:12: cannot use b[.]S{} [(]value of type b[.]S[)] as I5 value in variable declaration: b[.]S does not implement I5 [(]wrong type for method M5[)]
+			`7:12: cannot use b[.]S{} [(]value of struct type b[.]S[)] as I5 value in variable declaration: b[.]S does not implement I5 [(]wrong type for method M5[)]
 .*have M5[(]struct{b[.]S; b[.]t}[)]
 .*want M5[(]struct{b[.]S; t}[)]`},
 	}
@@ -828,8 +854,8 @@ func (S) M5(struct {S;t}) {}
 	fset := token.NewFileSet()
 	test := func(main, b, want string) {
 		re := regexp.MustCompile(want)
-		bpkg := mustTypecheck("b", b, nil, nil)
-		mast := mustParse(fset, "main.go", main)
+		bpkg := mustTypecheck(b, nil, nil)
+		mast := mustParse(fset, main)
 		conf := Config{Importer: importHelper{pkg: bpkg}}
 		_, err := conf.Check(mast.Name.Name, fset, []*ast.File{mast}, nil)
 		if err == nil {
@@ -842,5 +868,339 @@ func (S) M5(struct {S;t}) {}
 	}
 	for _, t := range tests {
 		test(t.main, t.b, t.want)
+	}
+}
+
+func TestIssue59944(t *testing.T) {
+	testenv.MustHaveCGO(t)
+
+	// Methods declared on aliases of cgo types are not permitted.
+	const src = `// -gotypesalias=1
+
+package p
+
+/*
+struct layout {};
+*/
+import "C"
+
+type Layout = C.struct_layout
+
+func (*Layout /* ERROR "cannot define new methods on non-local type Layout" */) Binding() {}
+`
+
+	// code generated by cmd/cgo for the above source.
+	const cgoTypes = `
+// Code generated by cmd/cgo; DO NOT EDIT.
+
+package p
+
+import "unsafe"
+
+import "syscall"
+
+import _cgopackage "runtime/cgo"
+
+type _ _cgopackage.Incomplete
+var _ syscall.Errno
+func _Cgo_ptr(ptr unsafe.Pointer) unsafe.Pointer { return ptr }
+
+//go:linkname _Cgo_always_false runtime.cgoAlwaysFalse
+var _Cgo_always_false bool
+//go:linkname _Cgo_use runtime.cgoUse
+func _Cgo_use(interface{})
+//go:linkname _Cgo_keepalive runtime.cgoKeepAlive
+//go:noescape
+func _Cgo_keepalive(interface{})
+//go:linkname _Cgo_no_callback runtime.cgoNoCallback
+func _Cgo_no_callback(bool)
+type _Ctype_struct_layout struct {
+}
+
+type _Ctype_void [0]byte
+
+//go:linkname _cgo_runtime_cgocall runtime.cgocall
+func _cgo_runtime_cgocall(unsafe.Pointer, uintptr) int32
+
+//go:linkname _cgoCheckPointer runtime.cgoCheckPointer
+//go:noescape
+func _cgoCheckPointer(interface{}, interface{})
+
+//go:linkname _cgoCheckResult runtime.cgoCheckResult
+//go:noescape
+func _cgoCheckResult(interface{})
+`
+	testFiles(t, []string{"p.go", "_cgo_gotypes.go"}, [][]byte{[]byte(src), []byte(cgoTypes)}, false, func(cfg *Config) {
+		*boolFieldAddr(cfg, "go115UsesCgo") = true
+	})
+}
+
+func TestIssue61931(t *testing.T) {
+	const src = `
+package p
+
+func A(func(any), ...any) {}
+func B[T any](T)          {}
+
+func _() {
+	A(B, nil // syntax error: missing ',' before newline in argument list
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, pkgName(src), src, 0)
+	if err == nil {
+		t.Fatal("expected syntax error")
+	}
+
+	var conf Config
+	conf.Check(f.Name.Name, fset, []*ast.File{f}, nil) // must not panic
+}
+
+func TestIssue61938(t *testing.T) {
+	const src = `
+package p
+
+func f[T any]() {}
+func _()        { f() }
+`
+	// no error handler provided (this issue)
+	var conf Config
+	typecheck(src, &conf, nil) // must not panic
+
+	// with error handler (sanity check)
+	conf.Error = func(error) {}
+	typecheck(src, &conf, nil) // must not panic
+}
+
+func TestIssue63260(t *testing.T) {
+	const src = `
+package p
+
+func _() {
+        use(f[*string])
+}
+
+func use(func()) {}
+
+func f[I *T, T any]() {
+        var v T
+        _ = v
+}`
+
+	info := Info{
+		Defs: make(map[*ast.Ident]Object),
+	}
+	pkg := mustTypecheck(src, nil, &info)
+
+	// get type parameter T in signature of f
+	T := pkg.Scope().Lookup("f").Type().(*Signature).TypeParams().At(1)
+	if T.Obj().Name() != "T" {
+		t.Fatalf("got type parameter %s, want T", T)
+	}
+
+	// get type of variable v in body of f
+	var v Object
+	for name, obj := range info.Defs {
+		if name.Name == "v" {
+			v = obj
+			break
+		}
+	}
+	if v == nil {
+		t.Fatal("variable v not found")
+	}
+
+	// type of v and T must be pointer-identical
+	if v.Type() != T {
+		t.Fatalf("types of v and T are not pointer-identical: %p != %p", v.Type().(*TypeParam), T)
+	}
+}
+
+func TestIssue44410(t *testing.T) {
+	const src = `
+package p
+
+type A = []int
+type S struct{ A }
+`
+
+	t.Setenv("GODEBUG", "gotypesalias=1")
+	pkg := mustTypecheck(src, nil, nil)
+
+	S := pkg.Scope().Lookup("S")
+	if S == nil {
+		t.Fatal("object S not found")
+	}
+
+	got := S.String()
+	const want = "type p.S struct{p.A}"
+	if got != want {
+		t.Fatalf("got %q; want %q", got, want)
+	}
+}
+
+func TestIssue59831(t *testing.T) {
+	// Package a exports a type S with an unexported method m;
+	// the tests check the error messages when m is not found.
+	const asrc = `package a; type S struct{}; func (S) m() {}`
+	apkg := mustTypecheck(asrc, nil, nil)
+
+	// Package b exports a type S with an exported method m;
+	// the tests check the error messages when M is not found.
+	const bsrc = `package b; type S struct{}; func (S) M() {}`
+	bpkg := mustTypecheck(bsrc, nil, nil)
+
+	tests := []struct {
+		imported *Package
+		src, err string
+	}{
+		// tests importing a (or nothing)
+		{apkg, `package a1; import "a"; var _ interface { M() } = a.S{}`,
+			"a.S does not implement interface{M()} (missing method M) have m() want M()"},
+
+		{apkg, `package a2; import "a"; var _ interface { m() } = a.S{}`,
+			"a.S does not implement interface{m()} (unexported method m)"}, // test for issue
+
+		{nil, `package a3; type S struct{}; func (S) m(); var _ interface { M() } = S{}`,
+			"S does not implement interface{M()} (missing method M) have m() want M()"},
+
+		{nil, `package a4; type S struct{}; func (S) m(); var _ interface { m() } = S{}`,
+			""}, // no error expected
+
+		{nil, `package a5; type S struct{}; func (S) m(); var _ interface { n() } = S{}`,
+			"S does not implement interface{n()} (missing method n)"},
+
+		// tests importing b (or nothing)
+		{bpkg, `package b1; import "b"; var _ interface { m() } = b.S{}`,
+			"b.S does not implement interface{m()} (missing method m) have M() want m()"},
+
+		{bpkg, `package b2; import "b"; var _ interface { M() } = b.S{}`,
+			""}, // no error expected
+
+		{nil, `package b3; type S struct{}; func (S) M(); var _ interface { M() } = S{}`,
+			""}, // no error expected
+
+		{nil, `package b4; type S struct{}; func (S) M(); var _ interface { m() } = S{}`,
+			"S does not implement interface{m()} (missing method m) have M() want m()"},
+
+		{nil, `package b5; type S struct{}; func (S) M(); var _ interface { n() } = S{}`,
+			"S does not implement interface{n()} (missing method n)"},
+	}
+
+	for _, test := range tests {
+		// typecheck test source
+		conf := Config{Importer: importHelper{pkg: test.imported}}
+		pkg, err := typecheck(test.src, &conf, nil)
+		if err == nil {
+			if test.err != "" {
+				t.Errorf("package %s: got no error, want %q", pkg.Name(), test.err)
+			}
+			continue
+		}
+		if test.err == "" {
+			t.Errorf("package %s: got %q, want not error", pkg.Name(), err.Error())
+		}
+
+		// flatten reported error message
+		errmsg := strings.ReplaceAll(err.Error(), "\n", " ")
+		errmsg = strings.ReplaceAll(errmsg, "\t", "")
+
+		// verify error message
+		if !strings.Contains(errmsg, test.err) {
+			t.Errorf("package %s: got %q, want %q", pkg.Name(), errmsg, test.err)
+		}
+	}
+}
+
+func TestIssue64759(t *testing.T) {
+	const src = `
+//go:build go1.18
+package p
+
+func f[S ~[]E, E any](S) {}
+
+func _() {
+	f([]string{})
+}
+`
+	// Per the go:build directive, the source must typecheck
+	// even though the (module) Go version is set to go1.17.
+	conf := Config{GoVersion: "go1.17"}
+	mustTypecheck(src, &conf, nil)
+}
+
+func TestIssue68334(t *testing.T) {
+	const src = `
+package p
+
+func f(x int) {
+	for i, j := range x {
+		_, _ = i, j
+	}
+	var a, b int
+	for a, b = range x {
+		_, _ = a, b
+	}
+}
+`
+
+	got := ""
+	conf := Config{
+		GoVersion: "go1.21",                                      // #68334 requires GoVersion <= 1.21
+		Error:     func(err error) { got += err.Error() + "\n" }, // #68334 requires Error != nil
+	}
+	typecheck(src, &conf, nil) // do not crash
+
+	want := "p:5:20: cannot range over x (variable of type int): requires go1.22 or later\n" +
+		"p:9:19: cannot range over x (variable of type int): requires go1.22 or later\n"
+	if got != want {
+		t.Errorf("got: %s want: %s", got, want)
+	}
+}
+
+func TestIssue68877(t *testing.T) {
+	const src = `
+package p
+
+type (
+	S struct{}
+	A = S
+	T A
+)`
+
+	t.Setenv("GODEBUG", "gotypesalias=1")
+	pkg := mustTypecheck(src, nil, nil)
+	T := pkg.Scope().Lookup("T").(*TypeName)
+	got := T.String() // this must not panic (was issue)
+	const want = "type p.T struct{}"
+	if got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestIssue69092(t *testing.T) {
+	const src = `
+package p
+
+var _ = T{{x}}
+`
+
+	fset := token.NewFileSet()
+	file := mustParse(fset, src)
+	conf := Config{Error: func(err error) {}} // ignore errors
+	info := Info{Types: make(map[ast.Expr]TypeAndValue)}
+	conf.Check("p", fset, []*ast.File{file}, &info)
+
+	// look for {x} expression
+	outer := file.Decls[0].(*ast.GenDecl).Specs[0].(*ast.ValueSpec).Values[0].(*ast.CompositeLit) // T{{x}}
+	inner := outer.Elts[0]                                                                        // {x}
+
+	// type of {x} must have been recorded
+	tv, ok := info.Types[inner]
+	if !ok {
+		t.Fatal("no type found for {x}")
+	}
+	if tv.Type != Typ[Invalid] {
+		t.Fatalf("unexpected type for {x}: %s", tv.Type)
 	}
 }

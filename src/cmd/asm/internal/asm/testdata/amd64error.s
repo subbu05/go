@@ -132,7 +132,7 @@ TEXT errors(SB),$0
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
-	// CLWB instuctions:
+	// CLWB instructions:
 	CLWB BX                          // ERROR "invalid instruction"
 	// CLDEMOTE instructions:
 	CLDEMOTE BX                      // ERROR "invalid instruction"
@@ -144,4 +144,7 @@ TEXT errors(SB),$0
 	VMOVDQA32.Z Z0, Z1               // ERROR "mask register must be specified for .Z instructions"
 	VMOVDQA32.Z Z0, K0, Z1           // ERROR "invalid instruction"
 	VMOVDQA32.Z Z0, K1, Z1           // ok
+
+	RDPID (BX)			 // ERROR "invalid instruction"
+
 	RET

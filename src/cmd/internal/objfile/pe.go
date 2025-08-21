@@ -11,6 +11,7 @@ import (
 	"debug/pe"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 )
 
@@ -78,7 +79,7 @@ func (f *peFile) symbols() ([]Sym, error) {
 		addrs = append(addrs, sym.Addr)
 	}
 
-	sort.Sort(uint64s(addrs))
+	slices.Sort(addrs)
 	for i := range syms {
 		j := sort.Search(len(addrs), func(x int) bool { return addrs[x] > syms[i].Addr })
 		if j < len(addrs) {
@@ -173,8 +174,6 @@ func (f *peFile) goarch() string {
 		return "386"
 	case pe.IMAGE_FILE_MACHINE_AMD64:
 		return "amd64"
-	case pe.IMAGE_FILE_MACHINE_ARMNT:
-		return "arm"
 	case pe.IMAGE_FILE_MACHINE_ARM64:
 		return "arm64"
 	default:

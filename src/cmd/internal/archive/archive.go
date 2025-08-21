@@ -70,6 +70,7 @@ const (
 	EntryPkgDef EntryType = iota
 	EntryGoObj
 	EntryNativeObj
+	EntrySentinelNonObj
 )
 
 func (e *Entry) String() string {
@@ -357,6 +358,23 @@ func (r *objReader) parseArchive(verbose bool) error {
 				Data:  Data{r.offset, size},
 			})
 			r.skip(size)
+		case "preferlinkext", "dynimportfail":
+			if size == 0 {
+				// These are not actual objects, but rather sentinel
+				// entries put into the archive by the Go command to
+				// be read by the linker. See #62036.
+				r.a.Entries = append(r.a.Entries, Entry{
+					Name:  name,
+					Type:  EntrySentinelNonObj,
+					Mtime: mtime,
+					Uid:   uid,
+					Gid:   gid,
+					Mode:  mode,
+					Data:  Data{r.offset, size},
+				})
+				break
+			}
+			fallthrough
 		default:
 			var typ EntryType
 			var o *GoObj
@@ -479,20 +497,6 @@ func exactly16Bytes(s string) string {
 
 // architecture-independent object file output
 const HeaderSize = 60
-
-func ReadHeader(b *bufio.Reader, name string) int {
-	var buf [HeaderSize]byte
-	if _, err := io.ReadFull(b, buf[:]); err != nil {
-		return -1
-	}
-	aname := strings.Trim(string(buf[0:16]), " ")
-	if !strings.HasPrefix(aname, name) {
-		return -1
-	}
-	asize := strings.Trim(string(buf[48:58]), " ")
-	i, _ := strconv.Atoi(asize)
-	return i
-}
 
 func FormatHeader(arhdr []byte, name string, size int64) {
 	copy(arhdr[:], fmt.Sprintf("%-16s%-12d%-6d%-6d%-8o%-10d`\n", name, 0, 0, 0, 0644, size))

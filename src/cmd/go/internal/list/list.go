@@ -10,14 +10,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
+
+	"golang.org/x/sync/semaphore"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cache"
@@ -240,6 +245,8 @@ applied to a Go struct, but now a Module struct:
         Retracted  []string      // retraction information, if any (with -retracted or -u)
         Deprecated string        // deprecation message, if any (with -u)
         Error      *ModuleError  // error loading module
+        Sum        string        // checksum for path, version (as in go.sum)
+        GoModSum   string        // checksum for go.mod (as in go.sum)
         Origin     any           // provenance of module
         Reuse      bool          // reuse of old module info is safe
     }
@@ -293,8 +300,8 @@ space-separated version list.
 
 The -retracted flag causes list to report information about retracted
 module versions. When -retracted is used with -f or -json, the Retracted
-field will be set to a string explaining why the version was retracted.
-The string is taken from comments on the retract directive in the
+field explains why the version was retracted.
+The strings are taken from comments on the retract directive in the
 module's go.mod file. When -retracted is used with -versions, retracted
 versions are listed together with unretracted versions. The -retracted
 flag may be used with or without -m.
@@ -338,10 +345,9 @@ For more about modules, see https://golang.org/ref/mod.
 
 func init() {
 	CmdList.Run = runList // break init cycle
-	work.AddBuildFlags(CmdList, work.DefaultBuildFlags)
-	if cfg.Experiment != nil && cfg.Experiment.CoverageRedesign {
-		work.AddCoverFlags(CmdList, nil)
-	}
+	// Omit build -json because list has its own -json
+	work.AddBuildFlags(CmdList, work.OmitJSONFlag)
+	work.AddCoverFlags(CmdList, nil)
 	CmdList.Flag.Var(&listJsonFields, "json", "")
 }
 
@@ -382,7 +388,7 @@ func (v *jsonFlag) Set(s string) error {
 }
 
 func (v *jsonFlag) String() string {
-	var fields []string
+	fields := make([]string, 0, len(*v))
 	for f := range *v {
 		fields = append(fields, f)
 	}
@@ -444,13 +450,15 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	if listJson {
 		do = func(x any) {
 			if !listJsonFields.needAll() {
-				v := reflect.ValueOf(x).Elem() // do is always called with a non-nil pointer.
-				// Clear all non-requested fields.
+				//  Set x to a copy of itself with all non-requested fields cleared.
+				v := reflect.New(reflect.TypeOf(x).Elem()).Elem() // do is always called with a non-nil pointer.
+				v.Set(reflect.ValueOf(x).Elem())
 				for i := 0; i < v.NumField(); i++ {
 					if !listJsonFields.needAny(v.Type().Field(i).Name) {
 						v.Field(i).SetZero()
 					}
 				}
+				x = v.Interface()
 			}
 			b, err := json.MarshalIndent(x, "", "\t")
 			if err != nil {
@@ -565,11 +573,11 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		if !*listE {
 			for _, m := range mods {
 				if m.Error != nil {
-					base.Errorf("go: %v", m.Error.Err)
+					base.Error(errors.New(m.Error.Err))
 				}
 			}
 			if err != nil {
-				base.Errorf("go: %v", err)
+				base.Error(err)
 			}
 			base.ExitIfErrors()
 		}
@@ -599,16 +607,9 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	}
 
 	pkgOpts := load.PackageOpts{
-		IgnoreImports:   *listFind,
-		ModResolveTests: *listTest,
-		AutoVCS:         true,
-		// SuppressDeps is set if the user opts to explicitly ask for the json fields they
-		// need, don't ask for Deps or DepsErrors. It's not set when using a template string,
-		// even if *listFmt doesn't contain .Deps because Deps are used to find import cycles
-		// for test variants of packages and users who have been providing format strings
-		// might not expect those errors to stop showing up.
-		// See issue #52443.
-		SuppressDeps:       !listJsonFields.needAny("Deps", "DepsErrors"),
+		IgnoreImports:      *listFind,
+		ModResolveTests:    *listTest,
+		AutoVCS:            true,
 		SuppressBuildInfo:  !*listExport && !listJsonFields.needAny("Stale", "StaleReason"),
 		SuppressEmbedFiles: !*listExport && !listJsonFields.needAny("EmbedFiles", "TestEmbedFiles", "XTestEmbedFiles"),
 	}
@@ -627,38 +628,46 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		base.ExitIfErrors()
 	}
 
-	if cache.Default() == nil {
-		// These flags return file names pointing into the build cache,
-		// so the build cache must exist.
-		if *listCompiled {
-			base.Fatalf("go list -compiled requires build cache")
-		}
-		if *listExport {
-			base.Fatalf("go list -export requires build cache")
-		}
-		if *listTest {
-			base.Fatalf("go list -test requires build cache")
-		}
-	}
-
 	if *listTest {
 		c := cache.Default()
 		// Add test binaries to packages to be listed.
+
+		var wg sync.WaitGroup
+		sema := semaphore.NewWeighted(int64(runtime.GOMAXPROCS(0)))
+		type testPackageSet struct {
+			p, pmain, ptest, pxtest *load.Package
+		}
+		var testPackages []testPackageSet
 		for _, p := range pkgs {
 			if len(p.TestGoFiles)+len(p.XTestGoFiles) > 0 {
 				var pmain, ptest, pxtest *load.Package
-				var err error
 				if *listE {
-					pmain, ptest, pxtest = load.TestPackagesAndErrors(ctx, pkgOpts, p, nil)
+					sema.Acquire(ctx, 1)
+					wg.Add(1)
+					done := func() {
+						sema.Release(1)
+						wg.Done()
+					}
+					pmain, ptest, pxtest = load.TestPackagesAndErrors(ctx, done, pkgOpts, p, nil)
 				} else {
-					pmain, ptest, pxtest, err = load.TestPackagesFor(ctx, pkgOpts, p, nil)
-					if err != nil {
-						base.Errorf("can't load test package: %s", err)
+					var perr *load.Package
+					pmain, ptest, pxtest, perr = load.TestPackagesFor(ctx, pkgOpts, p, nil)
+					if perr != nil {
+						base.Fatalf("go: can't load test package: %s", perr.Error)
 					}
 				}
-				if pmain != nil {
-					pkgs = append(pkgs, pmain)
-					data := *pmain.Internal.TestmainGo
+				testPackages = append(testPackages, testPackageSet{p, pmain, ptest, pxtest})
+			}
+		}
+		wg.Wait()
+		for _, pkgset := range testPackages {
+			p, pmain, ptest, pxtest := pkgset.p, pkgset.pmain, pkgset.ptest, pkgset.pxtest
+			if pmain != nil {
+				pkgs = append(pkgs, pmain)
+				data := *pmain.Internal.TestmainGo
+				sema.Acquire(ctx, 1)
+				wg.Add(1)
+				go func() {
 					h := cache.NewHash("testmain")
 					h.Write([]byte("testmain\n"))
 					h.Write(data)
@@ -667,15 +676,20 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 						base.Fatalf("%s", err)
 					}
 					pmain.GoFiles[0] = c.OutputFile(out)
-				}
-				if ptest != nil && ptest != p {
-					pkgs = append(pkgs, ptest)
-				}
-				if pxtest != nil {
-					pkgs = append(pkgs, pxtest)
-				}
+					sema.Release(1)
+					wg.Done()
+				}()
+
+			}
+			if ptest != nil && ptest != p {
+				pkgs = append(pkgs, ptest)
+			}
+			if pxtest != nil {
+				pkgs = append(pkgs, pxtest)
 			}
 		}
+
+		wg.Wait()
 	}
 
 	// Remember which packages are named on the command line.
@@ -705,13 +719,16 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		}
 		defer func() {
 			if err := b.Close(); err != nil {
-				base.Fatalf("go: %v", err)
+				base.Fatal(err)
 			}
 		}()
 
 		b.IsCmdList = true
 		b.NeedExport = *listExport
 		b.NeedCompiledGoFiles = *listCompiled
+		if cfg.BuildCover {
+			load.PrepareForCoverageBuild(pkgs)
+		}
 		a := &work.Action{}
 		// TODO: Use pkgsFilter?
 		for _, p := range pkgs {
@@ -766,24 +783,32 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 					p.Imports[i] = new
 				}
 			}
-			for old := range m {
-				delete(m, old)
+			clear(m)
+		}
+	}
+
+	if listJsonFields.needAny("Deps", "DepsErrors") {
+		all := pkgs
+		// Make sure we iterate through packages in a postorder traversal,
+		// which load.PackageList guarantees. If *listDeps, then all is
+		// already in PackageList order. Otherwise, calling load.PackageList
+		// provides the guarantee. In the case of an import cycle, the last package
+		// visited in the cycle, importing the first encountered package in the cycle,
+		// is visited first. The cycle import error will be bubbled up in the traversal
+		// order up to the first package in the cycle, covering all the packages
+		// in the cycle.
+		if !*listDeps {
+			all = load.PackageList(pkgs)
+		}
+		if listJsonFields.needAny("Deps") {
+			for _, p := range all {
+				collectDeps(p)
 			}
 		}
-		// Recompute deps lists using new strings, from the leaves up.
-		for _, p := range all {
-			deps := make(map[string]bool)
-			for _, p1 := range p.Internal.Imports {
-				deps[p1.ImportPath] = true
-				for _, d := range p1.Deps {
-					deps[d] = true
-				}
+		if listJsonFields.needAny("DepsErrors") {
+			for _, p := range all {
+				collectDepsErrors(p)
 			}
-			p.Deps = make([]string, 0, len(deps))
-			for d := range deps {
-				p.Deps = append(p.Deps, d)
-			}
-			sort.Strings(p.Deps)
 		}
 	}
 
@@ -827,7 +852,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 			}
 			rmods, err := modload.ListModules(ctx, args, mode, *listReuse)
 			if err != nil && !*listE {
-				base.Errorf("go: %v", err)
+				base.Error(err)
 			}
 			for i, arg := range args {
 				rmod := rmods[i]
@@ -884,6 +909,65 @@ func loadPackageList(roots []*load.Package) []*load.Package {
 	}
 
 	return pkgs
+}
+
+// collectDeps populates p.Deps by iterating over p.Internal.Imports.
+// collectDeps must be called on all of p's Imports before being called on p.
+func collectDeps(p *load.Package) {
+	deps := make(map[string]bool)
+
+	for _, p := range p.Internal.Imports {
+		deps[p.ImportPath] = true
+		for _, q := range p.Deps {
+			deps[q] = true
+		}
+	}
+
+	p.Deps = make([]string, 0, len(deps))
+	for dep := range deps {
+		p.Deps = append(p.Deps, dep)
+	}
+	sort.Strings(p.Deps)
+}
+
+// collectDepsErrors populates p.DepsErrors by iterating over p.Internal.Imports.
+// collectDepsErrors must be called on all of p's Imports before being called on p.
+func collectDepsErrors(p *load.Package) {
+	depsErrors := make(map[*load.PackageError]bool)
+
+	for _, p := range p.Internal.Imports {
+		if p.Error != nil {
+			depsErrors[p.Error] = true
+		}
+		for _, q := range p.DepsErrors {
+			depsErrors[q] = true
+		}
+	}
+
+	p.DepsErrors = make([]*load.PackageError, 0, len(depsErrors))
+	for deperr := range depsErrors {
+		p.DepsErrors = append(p.DepsErrors, deperr)
+	}
+	// Sort packages by the package on the top of the stack, which should be
+	// the package the error was produced for. Each package can have at most
+	// one error set on it.
+	sort.Slice(p.DepsErrors, func(i, j int) bool {
+		stki, stkj := p.DepsErrors[i].ImportStack, p.DepsErrors[j].ImportStack
+		// Some packages are missing import stacks. To ensure deterministic
+		// sort order compare two errors that are missing import stacks by
+		// their errors' error texts.
+		if len(stki) == 0 {
+			if len(stkj) != 0 {
+				return true
+			}
+
+			return p.DepsErrors[i].Err.Error() < p.DepsErrors[j].Err.Error()
+		} else if len(stkj) == 0 {
+			return false
+		}
+		pathi, pathj := stki[len(stki)-1], stkj[len(stkj)-1]
+		return pathi.Pkg < pathj.Pkg
+	})
 }
 
 // TrackingWriter tracks the last byte written on every write so

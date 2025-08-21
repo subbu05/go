@@ -108,7 +108,13 @@ func ttiSigpanic1() (res *ttiResult) {
 		recover()
 	}()
 	ttiSigpanic2()
-	panic("did not panic")
+	// without condition below the inliner might decide to de-prioritize
+	// the callsite above (since it would be on an "always leads to panic"
+	// path).
+	if alwaysTrue {
+		panic("did not panic")
+	}
+	return nil
 }
 func ttiSigpanic2() {
 	ttiSigpanic3()
@@ -117,6 +123,8 @@ func ttiSigpanic3() {
 	var p *int
 	*p = 3
 }
+
+var alwaysTrue = true
 
 //go:noinline
 func ttiWrapper1() *ttiResult {
@@ -411,6 +419,17 @@ func TestTracebackArgs(t *testing.T) {
 				"testTracebackArgs11b(0xffffffff?, 0xffffffff?, 0x3?, 0x4)",
 				"testTracebackArgs11b(0x1, 0x2, 0x3, 0x4)"),
 		},
+		// Make sure spilled slice data pointers are spilled to the right location
+		// to ensure we see it listed without a ?.
+		// See issue 64414.
+		{
+			func() int {
+				poisonStack()
+				return testTracebackArgsSlice(testTracebackArgsSliceBackingStore[:])
+			},
+			// Note: capacity of the slice might be junk, as it is not used.
+			fmt.Sprintf("testTracebackArgsSlice({%p, 0x2, ", &testTracebackArgsSliceBackingStore[0]),
+		},
 	}
 	for _, test := range tests {
 		n := test.fn()
@@ -442,7 +461,6 @@ func testTracebackArgs2(a bool, b struct {
 		return b.a + b.b + b.c + b.x[0] + b.x[1] + int(d[0]) + int(d[1]) + int(d[2])
 	}
 	return n
-
 }
 
 //go:noinline
@@ -659,6 +677,19 @@ func testTracebackArgs11b(a, b, c, d int32) int {
 	return runtime.Stack(testTracebackArgsBuf[:], false)
 }
 
+// norace to avoid race instrumentation changing spill locations.
+// nosplit to avoid preemption or morestack spilling registers.
+//
+//go:norace
+//go:nosplit
+//go:noinline
+func testTracebackArgsSlice(a []int) int {
+	n := runtime.Stack(testTracebackArgsBuf[:], false)
+	return a[1] + n
+}
+
+var testTracebackArgsSliceBackingStore [2]int
+
 // Poison the arg area with deterministic values.
 //
 //go:noinline
@@ -772,4 +803,67 @@ func parseTraceback1(t *testing.T, tb string) *traceback {
 		t.Fatalf("want 1 goroutine, got %d:\n%s", len(tbs), tb)
 	}
 	return tbs[0]
+}
+
+//go:noinline
+func testTracebackGenericFn[T any](buf []byte) int {
+	return runtime.Stack(buf[:], false)
+}
+
+func testTracebackGenericFnInlined[T any](buf []byte) int {
+	return runtime.Stack(buf[:], false)
+}
+
+type testTracebackGenericTyp[P any] struct{ x P }
+
+//go:noinline
+func (t testTracebackGenericTyp[P]) M(buf []byte) int {
+	return runtime.Stack(buf[:], false)
+}
+
+func (t testTracebackGenericTyp[P]) Inlined(buf []byte) int {
+	return runtime.Stack(buf[:], false)
+}
+
+func TestTracebackGeneric(t *testing.T) {
+	if *flagQuick {
+		t.Skip("-quick")
+	}
+	var x testTracebackGenericTyp[int]
+	tests := []struct {
+		fn     func([]byte) int
+		expect string
+	}{
+		// function, not inlined
+		{
+			testTracebackGenericFn[int],
+			"testTracebackGenericFn[...](",
+		},
+		// function, inlined
+		{
+			func(buf []byte) int { return testTracebackGenericFnInlined[int](buf) },
+			"testTracebackGenericFnInlined[...](",
+		},
+		// method, not inlined
+		{
+			x.M,
+			"testTracebackGenericTyp[...].M(",
+		},
+		// method, inlined
+		{
+			func(buf []byte) int { return x.Inlined(buf) },
+			"testTracebackGenericTyp[...].Inlined(",
+		},
+	}
+	var buf [1000]byte
+	for _, test := range tests {
+		n := test.fn(buf[:])
+		got := buf[:n]
+		if !bytes.Contains(got, []byte(test.expect)) {
+			t.Errorf("traceback does not contain expected string: want %q, got\n%s", test.expect, got)
+		}
+		if bytes.Contains(got, []byte("shape")) { // should not contain shape name
+			t.Errorf("traceback contains shape name: got\n%s", got)
+		}
+	}
 }

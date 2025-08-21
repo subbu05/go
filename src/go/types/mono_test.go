@@ -7,7 +7,6 @@ package types_test
 import (
 	"errors"
 	"fmt"
-	"go/importer"
 	"go/types"
 	"strings"
 	"testing"
@@ -19,9 +18,9 @@ func checkMono(t *testing.T, body string) error {
 	var buf strings.Builder
 	conf := types.Config{
 		Error:    func(err error) { fmt.Fprintln(&buf, err) },
-		Importer: importer.Default(),
+		Importer: defaultImporter(fset), // TODO(adonovan): use same FileSet as typecheck
 	}
-	typecheck("x", src, &conf, nil)
+	typecheck(src, &conf, nil)
 	if buf.Len() == 0 {
 		return nil
 	}

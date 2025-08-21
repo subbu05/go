@@ -41,17 +41,6 @@ func (fd *netFD) init() error {
 	return fd.pfd.Init(fd.net, true)
 }
 
-func (fd *netFD) name() string {
-	var ls, rs string
-	if fd.laddr != nil {
-		ls = fd.laddr.String()
-	}
-	if fd.raddr != nil {
-		rs = fd.raddr.String()
-	}
-	return fd.net + ":" + ls + "->" + rs
-}
-
 func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {
 	// Do not need to call fd.writeLock here,
 	// because fd is not yet accessible to user,
@@ -190,6 +179,9 @@ func (fd *netFD) accept() (netfd *netFD, err error) {
 	return netfd, nil
 }
 
+// Defined in os package.
+func newUnixFile(fd int, name string) *os.File
+
 func (fd *netFD) dup() (f *os.File, err error) {
 	ns, call, err := fd.pfd.Dup()
 	if err != nil {
@@ -199,5 +191,5 @@ func (fd *netFD) dup() (f *os.File, err error) {
 		return nil, err
 	}
 
-	return os.NewFile(uintptr(ns), fd.name()), nil
+	return newUnixFile(ns, fd.name()), nil
 }

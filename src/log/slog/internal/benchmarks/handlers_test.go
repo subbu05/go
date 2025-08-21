@@ -1,3 +1,7 @@
+// Copyright 2023 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package benchmarks
 
 import (
@@ -37,6 +41,6 @@ func TestHandlers(t *testing.T) {
 
 func attrSlice(r slog.Record) []slog.Attr {
 	var as []slog.Attr
-	r.Attrs(func(a slog.Attr) { as = append(as, a) })
+	r.Attrs(func(a slog.Attr) bool { as = append(as, a); return true })
 	return as
 }

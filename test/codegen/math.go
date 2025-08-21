@@ -57,6 +57,7 @@ func sqrt(x float64) float64 {
 	// mips64/hardfloat:"SQRTD" mips64/softfloat:-"SQRTD"
 	// wasm:"F64Sqrt"
 	// ppc64x:"FSQRT"
+	// riscv64: "FSQRTD"
 	return math.Sqrt(x)
 }
 
@@ -69,6 +70,7 @@ func sqrt32(x float32) float32 {
 	// mips64/hardfloat:"SQRTF" mips64/softfloat:-"SQRTF"
 	// wasm:"F32Sqrt"
 	// ppc64x:"FSQRTS"
+	// riscv64: "FSQRTS"
 	return float32(math.Sqrt(float64(x)))
 }
 
@@ -81,6 +83,8 @@ func abs(x, y float64) {
 	// riscv64:"FABSD\t"
 	// wasm:"F64Abs"
 	// arm/6:"ABSD\t"
+	// mips64/hardfloat:"ABSD\t"
+	// mips/hardfloat:"ABSD\t"
 	sink64[0] = math.Abs(x)
 
 	// amd64:"BTRQ\t[$]63","PXOR"    (TODO: this should be BTSQ)
@@ -128,6 +132,7 @@ func fma(x, y, z float64) float64 {
 	// amd64:"VFMADD231SD"
 	// arm/6:"FMULAD"
 	// arm64:"FMADDD"
+	// loong64:"FMADDD"
 	// s390x:"FMADD"
 	// ppc64x:"FMADD"
 	// riscv64:"FMADDD"
@@ -139,39 +144,111 @@ func fms(x, y, z float64) float64 {
 	return math.FMA(x, y, -z)
 }
 
-func fnma(x, y, z float64) float64 {
-	// riscv64:"FNMADDD"
+func fnms(x, y, z float64) float64 {
+	// riscv64:"FNMSUBD",-"FNMADDD"
 	return math.FMA(-x, y, z)
 }
 
-func fnms(x, y, z float64) float64 {
-	// riscv64:"FNMSUBD"
+func fnma(x, y, z float64) float64 {
+	// riscv64:"FNMADDD",-"FNMSUBD"
 	return math.FMA(x, -y, -z)
+}
+
+func isPosInf(x float64) bool {
+	// riscv64:"FCLASSD"
+	return math.IsInf(x, 1)
+}
+
+func isPosInfEq(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x == math.Inf(1)
+}
+
+func isPosInfCmp(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x > math.MaxFloat64
+}
+
+func isNotPosInf(x float64) bool {
+	// riscv64:"FCLASSD"
+	return !math.IsInf(x, 1)
+}
+
+func isNotPosInfEq(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x != math.Inf(1)
+}
+
+func isNotPosInfCmp(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x <= math.MaxFloat64
+}
+
+func isNegInf(x float64) bool {
+	// riscv64:"FCLASSD"
+	return math.IsInf(x, -1)
+}
+
+func isNegInfEq(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x == math.Inf(-1)
+}
+
+func isNegInfCmp(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x < -math.MaxFloat64
+}
+
+func isNotNegInf(x float64) bool {
+	// riscv64:"FCLASSD"
+	return !math.IsInf(x, -1)
+}
+
+func isNotNegInfEq(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x != math.Inf(-1)
+}
+
+func isNotNegInfCmp(x float64) bool {
+	// riscv64:"FCLASSD"
+	return x >= -math.MaxFloat64
 }
 
 func fromFloat64(f64 float64) uint64 {
 	// amd64:"MOVQ\tX.*, [^X].*"
 	// arm64:"FMOVD\tF.*, R.*"
+	// loong64:"MOVV\tF.*, R.*"
 	// ppc64x:"MFVSRD"
+	// mips64/hardfloat:"MOVV\tF.*, R.*"
+	// riscv64:"FMVXD"
 	return math.Float64bits(f64+1) + 1
 }
 
 func fromFloat32(f32 float32) uint32 {
 	// amd64:"MOVL\tX.*, [^X].*"
 	// arm64:"FMOVS\tF.*, R.*"
+	// loong64:"MOVW\tF.*, R.*"
+	// mips64/hardfloat:"MOVW\tF.*, R.*"
+	// riscv64:"FMVXW"
 	return math.Float32bits(f32+1) + 1
 }
 
 func toFloat64(u64 uint64) float64 {
 	// amd64:"MOVQ\t[^X].*, X.*"
 	// arm64:"FMOVD\tR.*, F.*"
+	// loong64:"MOVV\tR.*, F.*"
 	// ppc64x:"MTVSRD"
+	// mips64/hardfloat:"MOVV\tR.*, F.*"
+	// riscv64:"FMVDX"
 	return math.Float64frombits(u64+1) + 1
 }
 
 func toFloat32(u32 uint32) float32 {
 	// amd64:"MOVL\t[^X].*, X.*"
 	// arm64:"FMOVS\tR.*, F.*"
+	// loong64:"MOVW\tR.*, F.*"
+	// mips64/hardfloat:"MOVW\tR.*, F.*"
+	// riscv64:"FMVWX"
 	return math.Float32frombits(u32+1) + 1
 }
 
@@ -196,7 +273,9 @@ func constantCheck32() bool {
 func constantConvert32(x float32) float32 {
 	// amd64:"MOVSS\t[$]f32.3f800000\\(SB\\)"
 	// s390x:"FMOVS\t[$]f32.3f800000\\(SB\\)"
-	// ppc64x:"FMOVS\t[$]f32.3f800000\\(SB\\)"
+	// ppc64x/power8:"FMOVS\t[$]f32.3f800000\\(SB\\)"
+	// ppc64x/power9:"FMOVS\t[$]f32.3f800000\\(SB\\)"
+	// ppc64x/power10:"XXSPLTIDP\t[$]1065353216, VS0"
 	// arm64:"FMOVS\t[$]\\(1.0\\)"
 	if x > math.Float32frombits(0x3f800000) {
 		return -x
@@ -225,10 +304,11 @@ func nanGenerate64() float64 {
 
 	// amd64:"DIVSD"
 	z0 := zero / zero
-	// amd64:"MULSD"
+	// amd64/v1,amd64/v2:"MULSD"
 	z1 := zero * inf
 	// amd64:"SQRTSD"
 	z2 := math.Sqrt(negone)
+	// amd64/v3:"VFMADD231SD"
 	return z0 + z1 + z2
 }
 
@@ -239,7 +319,8 @@ func nanGenerate32() float32 {
 
 	// amd64:"DIVSS"
 	z0 := zero / zero
-	// amd64:"MULSS"
+	// amd64/v1,amd64/v2:"MULSS"
 	z1 := zero * inf
+	// amd64/v3:"VFMADD231SS"
 	return z0 + z1
 }

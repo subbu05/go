@@ -16,6 +16,8 @@ import (
 // The higher the level, the more important or severe the event.
 type Level int
 
+// Names for common levels.
+//
 // Level numbers are inherently arbitrary,
 // but we picked them to satisfy three constraints.
 // Any system can map them to another numbering scheme if it wishes.
@@ -23,7 +25,6 @@ type Level int
 // First, we wanted the default level to be Info, Since Levels are ints, Info is
 // the default value for int, zero.
 //
-
 // Second, we wanted to make it easy to use levels to specify logger verbosity.
 // Since a larger level means a more severe event, a logger that accepts events
 // with smaller (or more negative) level means a more verbose logger. Logger
@@ -39,8 +40,6 @@ type Level int
 // Level range. OpenTelemetry also has the names TRACE and FATAL, which slog
 // does not. But those OpenTelemetry levels can still be represented as slog
 // Levels by using the appropriate integers.
-//
-// Names for common levels.
 const (
 	LevelDebug Level = -4
 	LevelInfo  Level = 0
@@ -99,10 +98,16 @@ func (l *Level) UnmarshalJSON(data []byte) error {
 	return l.parse(s)
 }
 
-// MarshalText implements [encoding.TextMarshaler]
+// AppendText implements [encoding.TextAppender]
 // by calling [Level.String].
+func (l Level) AppendText(b []byte) ([]byte, error) {
+	return append(b, l.String()...), nil
+}
+
+// MarshalText implements [encoding.TextMarshaler]
+// by calling [Level.AppendText].
 func (l Level) MarshalText() ([]byte, error) {
-	return []byte(l.String()), nil
+	return l.AppendText(nil)
 }
 
 // UnmarshalText implements [encoding.TextUnmarshaler].
@@ -147,14 +152,14 @@ func (l *Level) parse(s string) (err error) {
 }
 
 // Level returns the receiver.
-// It implements Leveler.
+// It implements [Leveler].
 func (l Level) Level() Level { return l }
 
-// A LevelVar is a Level variable, to allow a Handler level to change
+// A LevelVar is a [Level] variable, to allow a [Handler] level to change
 // dynamically.
-// It implements Leveler as well as a Set method,
+// It implements [Leveler] as well as a Set method,
 // and it is safe for use by multiple goroutines.
-// The zero LevelVar corresponds to LevelInfo.
+// The zero LevelVar corresponds to [LevelInfo].
 type LevelVar struct {
 	val atomic.Int64
 }
@@ -173,10 +178,16 @@ func (v *LevelVar) String() string {
 	return fmt.Sprintf("LevelVar(%s)", v.Level())
 }
 
+// AppendText implements [encoding.TextAppender]
+// by calling [Level.AppendText].
+func (v *LevelVar) AppendText(b []byte) ([]byte, error) {
+	return v.Level().AppendText(b)
+}
+
 // MarshalText implements [encoding.TextMarshaler]
-// by calling [Level.MarshalText].
+// by calling [LevelVar.AppendText].
 func (v *LevelVar) MarshalText() ([]byte, error) {
-	return v.Level().MarshalText()
+	return v.AppendText(nil)
 }
 
 // UnmarshalText implements [encoding.TextUnmarshaler]
@@ -190,12 +201,12 @@ func (v *LevelVar) UnmarshalText(data []byte) error {
 	return nil
 }
 
-// A Leveler provides a Level value.
+// A Leveler provides a [Level] value.
 //
 // As Level itself implements Leveler, clients typically supply
-// a Level value wherever a Leveler is needed, such as in HandlerOptions.
+// a Level value wherever a Leveler is needed, such as in [HandlerOptions].
 // Clients who need to vary the level dynamically can provide a more complex
-// Leveler implementation such as *LevelVar.
+// Leveler implementation such as *[LevelVar].
 type Leveler interface {
 	Level() Level
 }

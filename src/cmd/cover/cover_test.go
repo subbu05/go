@@ -33,12 +33,7 @@ const (
 // test. At one point this was created via "go build"; we now reuse the unit
 // test executable itself.
 func testcover(t testing.TB) string {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Helper()
-		t.Fatal(err)
-	}
-	return exe
+	return testenv.Executable(t)
 }
 
 // testTempDir is a temporary directory created in TestMain.
@@ -113,8 +108,6 @@ func tempDir(t *testing.T) string {
 // "-toolexec" wrapper program to invoke the cover test executable
 // itself via "go test -cover".
 func TestCoverWithToolExec(t *testing.T) {
-	testenv.MustHaveExec(t)
-
 	toolexecArg := "-toolexec=" + testcover(t)
 
 	t.Run("CoverHTML", func(t *testing.T) {
@@ -338,8 +331,6 @@ func findDirectives(source []byte) []directiveInfo {
 // Makes sure that `cover -func=profile.cov` reports accurate coverage.
 // Issue #20515.
 func TestCoverFunc(t *testing.T) {
-	testenv.MustHaveExec(t)
-
 	// testcover -func ./testdata/profile.cov
 	coverProfile := filepath.Join(testdata, "profile.cov")
 	cmd := testenv.Command(t, testcover(t), "-func", coverProfile)
@@ -615,4 +606,35 @@ func TestCoverage(t *testing.T) { }
 	cmd.Env = append(cmd.Environ(), "CMDCOVER_TOOLEXEC=true")
 	cmd.Dir = noeolDir
 	run(cmd, t)
+}
+
+func TestSrcPathWithNewline(t *testing.T) {
+	testenv.MustHaveExec(t)
+	t.Parallel()
+
+	// srcPath is intentionally not clean so that the path passed to testcover
+	// will not normalize the trailing / to a \ on Windows.
+	srcPath := t.TempDir() + string(filepath.Separator) + "\npackage main\nfunc main() { panic(string([]rune{'u', 'h', '-', 'o', 'h'}))\n/*/main.go"
+	mainSrc := ` package main
+
+func main() {
+	/* nothing here */
+	println("ok")
+}
+`
+	if err := os.MkdirAll(filepath.Dir(srcPath), 0777); err != nil {
+		t.Skipf("creating directory with bogus path: %v", err)
+	}
+	if err := os.WriteFile(srcPath, []byte(mainSrc), 0666); err != nil {
+		t.Skipf("writing file with bogus directory: %v", err)
+	}
+
+	cmd := testenv.Command(t, testcover(t), "-mode=atomic", srcPath)
+	cmd.Stderr = new(bytes.Buffer)
+	out, err := cmd.Output()
+	t.Logf("%v:\n%s", cmd, out)
+	t.Logf("stderr:\n%s", cmd.Stderr)
+	if err == nil {
+		t.Errorf("unexpected success; want failure due to newline in file path")
+	}
 }

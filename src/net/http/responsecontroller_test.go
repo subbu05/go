@@ -1,3 +1,7 @@
+// Copyright 2022 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package http_test
 
 import (
@@ -156,7 +160,9 @@ func TestResponseControllerSetPastReadDeadline(t *testing.T) {
 }
 func testResponseControllerSetPastReadDeadline(t *testing.T, mode testMode) {
 	readc := make(chan struct{})
+	donec := make(chan struct{})
 	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		defer close(donec)
 		ctl := NewResponseController(w)
 		b := make([]byte, 3)
 		n, err := io.ReadFull(r.Body, b)
@@ -192,10 +198,19 @@ func testResponseControllerSetPastReadDeadline(t *testing.T, mode testMode) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer pw.Close()
 		pw.Write([]byte("one"))
-		<-readc
+		select {
+		case <-readc:
+		case <-donec:
+			select {
+			case <-readc:
+			default:
+				t.Errorf("server handler unexpectedly exited without closing readc")
+				return
+			}
+		}
 		pw.Write([]byte("two"))
-		pw.Close()
 	}()
 	defer wg.Wait()
 	res, err := cst.c.Post(cst.ts.URL, "text/foo", pr)
@@ -310,4 +325,19 @@ func testResponseControllerEnableFullDuplex(t *testing.T, mode testMode) {
 		}
 	}
 	pw.Close()
+}
+
+func TestIssue58237(t *testing.T) {
+	cst := newClientServerTest(t, http2Mode, HandlerFunc(func(w ResponseWriter, req *Request) {
+		ctl := NewResponseController(w)
+		if err := ctl.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
+			t.Errorf("ctl.SetReadDeadline() = %v, want nil", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}))
+	res, err := cst.c.Get(cst.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
 }

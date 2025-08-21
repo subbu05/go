@@ -200,7 +200,7 @@ func testGoroutineParallelism2(t *testing.T, load, netpoll bool) {
 				laddr = "127.0.0.1:0"
 			}
 			ln, err := net.Listen("tcp", laddr)
-			if err != nil {
+			if err == nil {
 				defer ln.Close() // yup, defer in a loop
 			}
 		}
@@ -1026,6 +1026,17 @@ func TestLockOSThreadTemplateThreadRace(t *testing.T) {
 	}
 }
 
+func TestLockOSThreadVgetrandom(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("vgetrandom only relevant on Linux")
+	}
+	output := runTestProg(t, "testprog", "LockOSThreadVgetrandom")
+	want := "OK\n"
+	if output != want {
+		t.Errorf("want %q, got %q", want, output)
+	}
+}
+
 // fakeSyscall emulates a system call.
 //
 //go:nosplit
@@ -1044,16 +1055,16 @@ func testPreemptionAfterSyscall(t *testing.T, syscallDuration time.Duration) {
 
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2))
 
-	interations := 10
+	iterations := 10
 	if testing.Short() {
-		interations = 1
+		iterations = 1
 	}
 	const (
 		maxDuration = 5 * time.Second
 		nroutines   = 8
 	)
 
-	for i := 0; i < interations; i++ {
+	for i := 0; i < iterations; i++ {
 		c := make(chan bool, nroutines)
 		stop := uint32(0)
 

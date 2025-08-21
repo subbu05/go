@@ -5,7 +5,6 @@
 package slog
 
 import (
-	"log/slog/internal/buffer"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,32 +22,60 @@ func TestRecordAttrs(t *testing.T) {
 	if got := attrsSlice(r); !attrsEqual(got, as) {
 		t.Errorf("got %v, want %v", got, as)
 	}
+
+	// Early return.
+	// Hit both loops in Record.Attrs: front and back.
+	for _, stop := range []int{2, 6} {
+		var got []Attr
+		r.Attrs(func(a Attr) bool {
+			got = append(got, a)
+			return len(got) < stop
+		})
+		want := as[:stop]
+		if !attrsEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	}
 }
 
-func TestRecordSourceLine(t *testing.T) {
-	// Zero call depth => empty file/line
+func TestRecordSource(t *testing.T) {
+	// Zero call depth => nil *Source.
 	for _, test := range []struct {
 		depth            int
+		wantFunction     string
 		wantFile         string
 		wantLinePositive bool
+		wantNil          bool
 	}{
-		{0, "", false},
-		{-16, "", false},
-		{1, "record_test.go", true}, // 1: caller of NewRecord
-		{2, "testing.go", true},
+		{0, "", "", false, true},
+		{-16, "", "", false, true},
+		{1, "log/slog.TestRecordSource", "record_test.go", true, false}, // 1: caller of NewRecord
+		{2, "testing.tRunner", "testing.go", true, false},
 	} {
 		var pc uintptr
 		if test.depth > 0 {
 			pc = callerPC(test.depth + 1)
 		}
 		r := NewRecord(time.Time{}, 0, "", pc)
-		gotFile, gotLine := sourceLine(r)
-		if i := strings.LastIndexByte(gotFile, '/'); i >= 0 {
-			gotFile = gotFile[i+1:]
+		got := r.Source()
+		if test.wantNil {
+			if got != nil {
+				t.Errorf("depth %d: got non-nil Source, want nil", test.depth)
+			}
+			continue
 		}
-		if gotFile != test.wantFile || (gotLine > 0) != test.wantLinePositive {
-			t.Errorf("depth %d: got (%q, %d), want (%q, %t)",
-				test.depth, gotFile, gotLine, test.wantFile, test.wantLinePositive)
+		if got == nil {
+			t.Errorf("depth %d: got nil Source, want non-nil", test.depth)
+			continue
+		}
+		if i := strings.LastIndexByte(got.File, '/'); i >= 0 {
+			got.File = got.File[i+1:]
+		}
+		if got.Function != test.wantFunction || got.File != test.wantFile || (got.Line > 0) != test.wantLinePositive {
+			t.Errorf("depth %d: got (%q, %q, %d), want (%q, %q, %t)",
+				test.depth,
+				got.Function, got.File, got.Line,
+				test.wantFunction, test.wantFile, test.wantLinePositive)
 		}
 	}
 }
@@ -80,12 +107,15 @@ func TestAliasingAndClone(t *testing.T) {
 	r1.back = b
 	// Make a copy that shares state.
 	r2 := r1
-	// Adding to both should panic.
+	// Adding to both should insert a special Attr in the second.
+	r1AttrsBefore := attrsSlice(r1)
 	r1.AddAttrs(Int("p", 0))
-	if !panics(func() { r2.AddAttrs(Int("p", 1)) }) {
-		t.Error("expected panic")
-	}
+	r2.AddAttrs(Int("p", 1))
+	check(r1, append(slices.Clip(r1AttrsBefore), Int("p", 0)))
 	r1Attrs := attrsSlice(r1)
+	check(r2, append(slices.Clip(r1AttrsBefore),
+		String("!BUG", "AddAttrs unsafely called on copy of Record made without using Record.Clone"), Int("p", 1)))
+
 	// Adding to a clone is fine.
 	r2 = r1.Clone()
 	check(r2, r1Attrs)
@@ -102,7 +132,7 @@ func newRecordWithAttrs(as []Attr) Record {
 
 func attrsSlice(r Record) []Attr {
 	s := make([]Attr, 0, r.NumAttrs())
-	r.Attrs(func(a Attr) { s = append(s, a) })
+	r.Attrs(func(a Attr) bool { s = append(s, a); return true })
 	return s
 }
 
@@ -125,29 +155,6 @@ func BenchmarkPC(b *testing.B) {
 	}
 }
 
-func BenchmarkSourceLine(b *testing.B) {
-	r := NewRecord(time.Now(), LevelInfo, "", 5)
-	b.Run("alone", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			file, line := sourceLine(r)
-			_ = file
-			_ = line
-		}
-	})
-	b.Run("stringifying", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			file, line := sourceLine(r)
-			buf := buffer.New()
-			buf.WriteString(file)
-			buf.WriteByte(':')
-			buf.WritePosInt(line)
-			s := buf.String()
-			buf.Free()
-			_ = s
-		}
-	})
-}
-
 func BenchmarkRecord(b *testing.B) {
 	const nAttrs = nAttrsInline * 10
 	var a Attr
@@ -157,7 +164,7 @@ func BenchmarkRecord(b *testing.B) {
 		for j := 0; j < nAttrs; j++ {
 			r.AddAttrs(Int("k", j))
 		}
-		r.Attrs(func(b Attr) { a = b })
+		r.Attrs(func(b Attr) bool { a = b; return true })
 	}
 	_ = a
 }

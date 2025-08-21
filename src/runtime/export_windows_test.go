@@ -6,18 +6,34 @@
 
 package runtime
 
-import "unsafe"
-
-const MaxArgs = maxArgs
+import (
+	"internal/runtime/sys"
+	"unsafe"
+)
 
 var (
-	TestingWER              = &testingWER
 	OsYield                 = osyield
 	TimeBeginPeriodRetValue = &timeBeginPeriodRetValue
 )
 
 func NumberOfProcessors() int32 {
 	var info systeminfo
-	stdcall1(_GetSystemInfo, uintptr(unsafe.Pointer(&info)))
+	stdcall(_GetSystemInfo, uintptr(unsafe.Pointer(&info)))
 	return int32(info.dwnumberofprocessors)
+}
+
+type ContextStub struct {
+	context
+}
+
+func (c ContextStub) GetPC() uintptr {
+	return c.ip()
+}
+
+func NewContextStub() *ContextStub {
+	var ctx context
+	ctx.set_ip(sys.GetCallerPC())
+	ctx.set_sp(sys.GetCallerSP())
+	ctx.set_fp(getcallerfp())
+	return &ContextStub{ctx}
 }

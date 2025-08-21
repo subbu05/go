@@ -33,7 +33,7 @@ var (
 	javaRegExp = regexp.MustCompile(`^(?:[a-z]\w*\.)*([A-Z][\w\$]*\.(?:<init>|[a-z][\w\$]*(?:\$\d+)?))(?:(?:\()|$)`)
 	// Removes package name and method arguments for Go function names.
 	// See tests for examples.
-	goRegExp = regexp.MustCompile(`^(?:[\w\-\.]+\/)+(.+)`)
+	goRegExp = regexp.MustCompile(`^(?:[\w\-\.]+\/)+([^.]+\..+)`)
 	// Removes potential module versions in a package path.
 	goVerRegExp = regexp.MustCompile(`^(.*?)/v(?:[2-9]|[1-9][0-9]+)([./].*)$`)
 	// Strips C++ namespace prefix from a C++ function / method name.
@@ -154,6 +154,7 @@ type NodeInfo struct {
 	Address           uint64
 	File              string
 	StartLine, Lineno int
+	Columnno          int
 	Objfile           string
 }
 
@@ -174,8 +175,12 @@ func (i *NodeInfo) NameComponents() []string {
 
 	switch {
 	case i.Lineno != 0:
+		s := fmt.Sprintf("%s:%d", i.File, i.Lineno)
+		if i.Columnno != 0 {
+			s += fmt.Sprintf(":%d", i.Columnno)
+		}
 		// User requested line numbers, provide what we have.
-		name = append(name, fmt.Sprintf("%s:%d", i.File, i.Lineno))
+		name = append(name, s)
 	case i.File != "":
 		// User requested file name, provide it.
 		name = append(name, i.File)
@@ -239,6 +244,7 @@ func (nm NodeMap) FindOrInsertNode(info NodeInfo, kept NodeSet) *Node {
 	// Find a node that represents the whole function.
 	info.Address = 0
 	info.Lineno = 0
+	info.Columnno = 0
 	n.Function = nm.FindOrInsertNode(info, nil)
 	return n
 }
@@ -330,12 +336,8 @@ func newGraph(prof *profile.Profile, o *Options) (*Graph, map[uint64]Nodes) {
 		if dw == 0 && w == 0 {
 			continue
 		}
-		for k := range seenNode {
-			delete(seenNode, k)
-		}
-		for k := range seenEdge {
-			delete(seenEdge, k)
-		}
+		clear(seenNode)
+		clear(seenEdge)
 		var parent *Node
 		// A residual edge goes over one or more nodes that were not kept.
 		residual := false
@@ -438,7 +440,7 @@ func newTree(prof *profile.Profile, o *Options) (g *Graph) {
 		}
 	}
 
-	nodes := make(Nodes, len(prof.Location))
+	nodes := make(Nodes, 0, len(prof.Location))
 	for _, nm := range parentNodeMap {
 		nodes = append(nodes, nm.nodes()...)
 	}
@@ -592,9 +594,10 @@ func nodeInfo(l *profile.Location, line profile.Line, objfile string, o *Options
 		return &NodeInfo{Address: l.Address, Objfile: objfile}
 	}
 	ni := &NodeInfo{
-		Address: l.Address,
-		Lineno:  int(line.Line),
-		Name:    line.Function.Name,
+		Address:  l.Address,
+		Lineno:   int(line.Line),
+		Columnno: int(line.Column),
+		Name:     line.Function.Name,
 	}
 	if fname := line.Function.Filename; fname != "" {
 		ni.File = filepath.Clean(fname)
@@ -843,10 +846,7 @@ func (g *Graph) selectTopNodes(maxNodes int, visualMode bool) Nodes {
 			// If generating a visual graph, count tags as nodes. Update
 			// maxNodes to account for them.
 			for i, n := range g.Nodes {
-				tags := countTags(n)
-				if tags > maxNodelets {
-					tags = maxNodelets
-				}
+				tags := min(countTags(n), maxNodelets)
 				if count += tags + 1; count >= maxNodes {
 					maxNodes = i + 1
 					break

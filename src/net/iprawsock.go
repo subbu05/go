@@ -6,6 +6,7 @@ package net
 
 import (
 	"context"
+	"net/netip"
 	"syscall"
 )
 
@@ -24,8 +25,12 @@ import (
 // BUG(mikio): On JS and Plan 9, methods and functions related
 // to IPConn are not implemented.
 
-// BUG(mikio): On Windows, the File method of IPConn is not
-// implemented.
+func ipAddrFromAddr(addr netip.Addr) *IPAddr {
+	return &IPAddr{
+		IP:   addr.AsSlice(),
+		Zone: addr.Zone(),
+	}
+}
 
 // IPAddr represents the address of an IP end point.
 type IPAddr struct {
@@ -72,7 +77,7 @@ func (a *IPAddr) opAddr() Addr {
 // recommended, because it will return at most one of the host name's
 // IP addresses.
 //
-// See func Dial for a description of the network and address
+// See func [Dial] for a description of the network and address
 // parameters.
 func ResolveIPAddr(network, address string) (*IPAddr, error) {
 	if network == "" { // a hint wildcard for Go 1.0 undocumented behavior
@@ -94,19 +99,19 @@ func ResolveIPAddr(network, address string) (*IPAddr, error) {
 	return addrs.forResolve(network, address).(*IPAddr), nil
 }
 
-// IPConn is the implementation of the Conn and PacketConn interfaces
+// IPConn is the implementation of the [Conn] and [PacketConn] interfaces
 // for IP network connections.
 type IPConn struct {
 	conn
 }
 
 // SyscallConn returns a raw network connection.
-// This implements the syscall.Conn interface.
+// This implements the [syscall.Conn] interface.
 func (c *IPConn) SyscallConn() (syscall.RawConn, error) {
 	if !c.ok() {
 		return nil, syscall.EINVAL
 	}
-	return newRawConn(c.fd)
+	return newRawConn(c.fd), nil
 }
 
 // ReadFromIP acts like ReadFrom but returns an IPAddr.
@@ -121,7 +126,7 @@ func (c *IPConn) ReadFromIP(b []byte) (int, *IPAddr, error) {
 	return n, addr, err
 }
 
-// ReadFrom implements the PacketConn ReadFrom method.
+// ReadFrom implements the [PacketConn] ReadFrom method.
 func (c *IPConn) ReadFrom(b []byte) (int, Addr, error) {
 	if !c.ok() {
 		return 0, nil, syscall.EINVAL
@@ -154,7 +159,7 @@ func (c *IPConn) ReadMsgIP(b, oob []byte) (n, oobn, flags int, addr *IPAddr, err
 	return
 }
 
-// WriteToIP acts like WriteTo but takes an IPAddr.
+// WriteToIP acts like [IPConn.WriteTo] but takes an [IPAddr].
 func (c *IPConn) WriteToIP(b []byte, addr *IPAddr) (int, error) {
 	if !c.ok() {
 		return 0, syscall.EINVAL
@@ -166,7 +171,7 @@ func (c *IPConn) WriteToIP(b []byte, addr *IPAddr) (int, error) {
 	return n, err
 }
 
-// WriteTo implements the PacketConn WriteTo method.
+// WriteTo implements the [PacketConn] WriteTo method.
 func (c *IPConn) WriteTo(b []byte, addr Addr) (int, error) {
 	if !c.ok() {
 		return 0, syscall.EINVAL
@@ -201,7 +206,7 @@ func (c *IPConn) WriteMsgIP(b, oob []byte, addr *IPAddr) (n, oobn int, err error
 
 func newIPConn(fd *netFD) *IPConn { return &IPConn{conn{fd}} }
 
-// DialIP acts like Dial for IP networks.
+// DialIP acts like [Dial] for IP networks.
 //
 // The network must be an IP network name; see func Dial for details.
 //
@@ -209,18 +214,25 @@ func newIPConn(fd *netFD) *IPConn { return &IPConn{conn{fd}} }
 // If the IP field of raddr is nil or an unspecified IP address, the
 // local system is assumed.
 func DialIP(network string, laddr, raddr *IPAddr) (*IPConn, error) {
+	return dialIP(context.Background(), nil, network, laddr, raddr)
+}
+
+func dialIP(ctx context.Context, dialer *Dialer, network string, laddr, raddr *IPAddr) (*IPConn, error) {
 	if raddr == nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}
 	}
 	sd := &sysDialer{network: network, address: raddr.String()}
-	c, err := sd.dialIP(context.Background(), laddr, raddr)
+	if dialer != nil {
+		sd.Dialer = *dialer
+	}
+	c, err := sd.dialIP(ctx, laddr, raddr)
 	if err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: err}
 	}
 	return c, nil
 }
 
-// ListenIP acts like ListenPacket for IP networks.
+// ListenIP acts like [ListenPacket] for IP networks.
 //
 // The network must be an IP network name; see func Dial for details.
 //

@@ -5,6 +5,7 @@
 package slog_test
 
 import (
+	"context"
 	"log/slog"
 	"os"
 )
@@ -25,7 +26,7 @@ func ExampleHandlerOptions_customLevels() {
 		LevelEmergency = slog.Level(12)
 	)
 
-	th := slog.HandlerOptions{
+	th := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		// Set a custom level to show all log output. The default value is
 		// LevelInfo, which would drop Debug and Trace logs.
 		Level: LevelTrace,
@@ -69,16 +70,17 @@ func ExampleHandlerOptions_customLevels() {
 
 			return a
 		},
-	}.NewTextHandler(os.Stdout)
+	})
 
 	logger := slog.New(th)
-	logger.Log(nil, LevelEmergency, "missing pilots")
+	ctx := context.Background()
+	logger.Log(ctx, LevelEmergency, "missing pilots")
 	logger.Error("failed to start engines", "err", "missing fuel")
 	logger.Warn("falling back to default value")
-	logger.Log(nil, LevelNotice, "all systems are running")
+	logger.Log(ctx, LevelNotice, "all systems are running")
 	logger.Info("initiating launch")
 	logger.Debug("starting background job")
-	logger.Log(nil, LevelTrace, "button clicked")
+	logger.Log(ctx, LevelTrace, "button clicked")
 
 	// Output:
 	// sev=EMERGENCY msg="missing pilots"

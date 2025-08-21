@@ -12,8 +12,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,7 +101,7 @@ func TestEverything(t *testing.T) {
 	// Now test they're visited in sort order.
 	var flagNames []string
 	Visit(func(f *Flag) { flagNames = append(flagNames, f.Name) })
-	if !sort.StringsAreSorted(flagNames) {
+	if !slices.IsSorted(flagNames) {
 		t.Errorf("flag names not sorted: %v", flagNames)
 	}
 }
@@ -700,7 +701,7 @@ func TestExitCode(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		cmd := exec.Command(os.Args[0], "-test.run=TestExitCode")
+		cmd := exec.Command(testenv.Executable(t), "-test.run=^TestExitCode$")
 		cmd.Env = append(
 			os.Environ(),
 			"GO_CHILD_FLAG="+test.flag,
@@ -726,7 +727,7 @@ func mustPanic(t *testing.T, testName string, expected string, f func()) {
 		case nil:
 			t.Errorf("%s\n: expected panic(%q), but did not panic", testName, expected)
 		case string:
-			if msg != expected {
+			if ok, _ := regexp.MatchString(expected, msg); !ok {
 				t.Errorf("%s\n: expected panic(%q), but got panic(%q)", testName, expected, msg)
 			}
 		default:
@@ -843,4 +844,15 @@ func TestUserDefinedBoolFunc(t *testing.T) {
 	} else if errMsg := err.Error(); !strings.Contains(errMsg, "test error") {
 		t.Errorf(`got %q; error should contain "test error"`, errMsg)
 	}
+}
+
+func TestDefineAfterSet(t *testing.T) {
+	flags := NewFlagSet("test", ContinueOnError)
+	// Set by itself doesn't panic.
+	flags.Set("myFlag", "value")
+
+	// Define-after-set panics.
+	mustPanic(t, "DefineAfterSet", "flag myFlag set at .*/flag_test.go:.* before being defined", func() {
+		_ = flags.String("myFlag", "default", "usage")
+	})
 }

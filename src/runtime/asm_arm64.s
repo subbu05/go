@@ -8,6 +8,28 @@
 #include "funcdata.h"
 #include "textflag.h"
 
+#ifdef GOARM64_LSE
+DATA no_lse_msg<>+0x00(SB)/64, $"This program can only run on ARM64 processors with LSE support.\n"
+GLOBL no_lse_msg<>(SB), RODATA, $64
+#endif
+
+// We know for sure that Linux and FreeBSD allow to read instruction set
+// attribute registers (while some others OSes, like OpenBSD and Darwin,
+// are not). Let's be conservative and allow code reading such registers
+// only when we sure this won't lead to sigill.
+#ifdef GOOS_linux
+#define ISA_REGS_READABLE
+#endif
+#ifdef GOOS_freebsd
+#define ISA_REGS_READABLE
+#endif
+
+#ifdef GOARM64_LSE
+#ifdef ISA_REGS_READABLE
+#define CHECK_GOARM64_LSE
+#endif
+#endif
+
 TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	// SP = stack; R0 = argc; R1 = argv
 
@@ -59,7 +81,7 @@ nocgo:
 	BL	runtime·save_g(SB)
 	// update stackguard after _cgo_init
 	MOVD	(g_stack+stack_lo)(g), R0
-	ADD	$const__StackGuard, R0
+	ADD	$const_stackGuard, R0
 	MOVD	R0, g_stackguard0(g)
 	MOVD	R0, g_stackguard1(g)
 
@@ -75,6 +97,19 @@ nocgo:
 
 #ifdef GOOS_windows
 	BL	runtime·wintls(SB)
+#endif
+
+	// Check that CPU we use for execution supports instructions targeted during compile-time.
+#ifdef CHECK_GOARM64_LSE
+	// Read the ID_AA64ISAR0_EL1 register
+	MRS	ID_AA64ISAR0_EL1, R0
+
+	// Extract the LSE field (bits [23:20])
+	LSR	$20, R0, R0
+	AND	$0xf, R0, R0
+
+	// LSE support is indicated by a non-zero value
+	CBZ	R0, no_lse
 #endif
 
 	MOVW	8(RSP), R0	// copy argc
@@ -95,9 +130,25 @@ nocgo:
 
 	// start this M
 	BL	runtime·mstart(SB)
+	UNDEF
 
-	// Prevent dead-code elimination of debugCallV2, which is
+#ifdef CHECK_GOARM64_LSE
+no_lse:
+	MOVD	$1, R0 // stderr
+	MOVD	R0, 8(RSP)
+	MOVD	$no_lse_msg<>(SB), R1 // message address
+	MOVD	R1, 16(RSP)
+	MOVD	$64, R2 // message length
+	MOVD	R2, 24(RSP)
+	CALL	runtime·write(SB)
+	CALL	runtime·exit(SB)
+	CALL	runtime·abort(SB)
+	RET
+#endif
+
+	// Prevent dead-code elimination of debugCallV2 and debugPinnerV1, which are
 	// intended to be called by debuggers.
+	MOVD	$runtime·debugPinnerV1<ABIInternal>(SB), R0
 	MOVD	$runtime·debugCallV2<ABIInternal>(SB), R0
 
 	MOVD	$0, R0
@@ -148,11 +199,9 @@ TEXT gogo<>(SB), NOSPLIT|NOFRAME, $0
 	MOVD	R0, RSP
 	MOVD	gobuf_bp(R5), R29
 	MOVD	gobuf_lr(R5), LR
-	MOVD	gobuf_ret(R5), R0
 	MOVD	gobuf_ctxt(R5), R26
 	MOVD	$0, gobuf_sp(R5)
 	MOVD	$0, gobuf_bp(R5)
-	MOVD	$0, gobuf_ret(R5)
 	MOVD	$0, gobuf_lr(R5)
 	MOVD	$0, gobuf_ctxt(R5)
 	CMP	ZR, ZR // set condition codes for == test, needed by stack split
@@ -184,7 +233,7 @@ TEXT runtime·mcall<ABIInternal>(SB), NOSPLIT|NOFRAME, $0-8
 
 	MOVD	(g_sched+gobuf_sp)(g), R0
 	MOVD	R0, RSP	// sp = m->g0->sched.sp
-	MOVD	(g_sched+gobuf_bp)(g), R29
+	MOVD	$0, R29				// clear frame pointer, as caller may execute on another M
 	MOVD	R3, R0				// arg = g
 	MOVD	$0, -16(RSP)			// dummy LR
 	SUB	$16, RSP
@@ -227,7 +276,10 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	B	runtime·abort(SB)
 
 switch:
-	// save our state in g->sched. Pretend to
+	// Switch stacks.
+	// The original frame pointer is stored in R29,
+	// which is useful for stack unwinding.
+	// Save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
 	BL	gosave_systemstack_switch<>(SB)
 
@@ -236,7 +288,6 @@ switch:
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R3
 	MOVD	R3, RSP
-	MOVD	(g_sched+gobuf_bp)(g), R29
 
 	// call target function
 	MOVD	0(R26), R3	// code pointer
@@ -262,6 +313,30 @@ noswitch:
 	SUB	$8, RSP, R29	// restore FP
 	B	(R3)
 
+// func switchToCrashStack0(fn func())
+TEXT runtime·switchToCrashStack0<ABIInternal>(SB), NOSPLIT, $0-8
+	MOVD	R0, R26    // context register
+	MOVD	g_m(g), R1 // curm
+
+	// set g to gcrash
+	MOVD	$runtime·gcrash(SB), g // g = &gcrash
+	BL	runtime·save_g(SB)         // clobbers R0
+	MOVD	R1, g_m(g)             // g.m = curm
+	MOVD	g, m_g0(R1)            // curm.g0 = g
+
+	// switch to crashstack
+	MOVD	(g_stack+stack_hi)(g), R1
+	SUB	$(4*8), R1
+	MOVD	R1, RSP
+
+	// call target function
+	MOVD	0(R26), R0
+	CALL	(R0)
+
+	// should never return
+	CALL	runtime·abort(SB)
+	UNDEF
+
 /*
  * support for morestack
  */
@@ -278,6 +353,16 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	MOVD	g_m(g), R8
 	MOVD	m_g0(R8), R4
+
+	// Called from f.
+	// Set g->sched to context in f
+	MOVD	RSP, R0
+	MOVD	R0, (g_sched+gobuf_sp)(g)
+	MOVD	R29, (g_sched+gobuf_bp)(g)
+	MOVD	LR, (g_sched+gobuf_pc)(g)
+	MOVD	R3, (g_sched+gobuf_lr)(g)
+	MOVD	R26, (g_sched+gobuf_ctxt)(g)
+
 	CMP	g, R4
 	BNE	3(PC)
 	BL	runtime·badmorestackg0(SB)
@@ -291,15 +376,6 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	B	runtime·abort(SB)
 
 	// Called from f.
-	// Set g->sched to context in f
-	MOVD	RSP, R0
-	MOVD	R0, (g_sched+gobuf_sp)(g)
-	MOVD	R29, (g_sched+gobuf_bp)(g)
-	MOVD	LR, (g_sched+gobuf_pc)(g)
-	MOVD	R3, (g_sched+gobuf_lr)(g)
-	MOVD	R26, (g_sched+gobuf_ctxt)(g)
-
-	// Called from f.
 	// Set m->morebuf to f's callers.
 	MOVD	R3, (m_morebuf+gobuf_pc)(R8)	// f's caller's PC
 	MOVD	RSP, R0
@@ -311,7 +387,7 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R0
 	MOVD	R0, RSP
-	MOVD	(g_sched+gobuf_bp)(g), R29
+	MOVD	$0, R29		// clear frame pointer, as caller may execute on another M
 	MOVD.W	$0, -16(RSP)	// create a call frame on g0 (saved LR; keep 16-aligned)
 	BL	runtime·newstack(SB)
 
@@ -611,6 +687,7 @@ done:
 	AESE	V0.B16, V2.B16
 	AESMC	V2.B16, V2.B16
 	AESE	V0.B16, V2.B16
+	AESMC	V2.B16, V2.B16
 
 	VMOV	V2.D[0], R0
 	RET
@@ -908,7 +985,6 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT|NOFRAME,$0
 	MOVD	R0, (g_sched+gobuf_sp)(g)
 	MOVD	R29, (g_sched+gobuf_bp)(g)
 	MOVD	$0, (g_sched+gobuf_lr)(g)
-	MOVD	$0, (g_sched+gobuf_ret)(g)
 	// Assert ctxt is zero. See func save.
 	MOVD	(g_sched+gobuf_ctxt)(g), R0
 	CBZ	R0, 2(PC)
@@ -1014,10 +1090,20 @@ nosave:
 TEXT ·cgocallback(SB),NOSPLIT,$24-24
 	NO_LOCAL_POINTERS
 
+	// Skip cgocallbackg, just dropm when fn is nil, and frame is the saved g.
+	// It is used to dropm while thread is exiting.
+	MOVD	fn+0(FP), R1
+	CBNZ	R1, loadg
+	// Restore the g from frame.
+	MOVD	frame+8(FP), g
+	B	dropm
+
+loadg:
 	// Load g from thread-local storage.
 	BL	runtime·load_g(SB)
 
-	// If g is nil, Go did not create the current thread.
+	// If g is nil, Go did not create the current thread,
+	// or if this thread never called into Go on pthread platforms.
 	// Call needm to obtain one for temporary use.
 	// In this case, we're running on the thread stack, so there's
 	// lots of space, but the linker doesn't know. Hide the call from
@@ -1030,7 +1116,7 @@ TEXT ·cgocallback(SB),NOSPLIT,$24-24
 
 needm:
 	MOVD	g, savedm-8(SP) // g is zero, so is m.
-	MOVD	$runtime·needm(SB), R0
+	MOVD	$runtime·needAndBindM(SB), R0
 	BL	(R0)
 
 	// Set m->g0->sched.sp = SP, so that if a panic happens
@@ -1111,10 +1197,24 @@ havem:
 	MOVD	savedsp-16(SP), R4
 	MOVD	R4, (g_sched+gobuf_sp)(g)
 
-	// If the m on entry was nil, we called needm above to borrow an m
-	// for the duration of the call. Since the call is over, return it with dropm.
+	// If the m on entry was nil, we called needm above to borrow an m,
+	// 1. for the duration of the call on non-pthread platforms,
+	// 2. or the duration of the C thread alive on pthread platforms.
+	// If the m on entry wasn't nil,
+	// 1. the thread might be a Go thread,
+	// 2. or it wasn't the first call from a C thread on pthread platforms,
+	//    since then we skip dropm to reuse the m in the first call.
 	MOVD	savedm-8(SP), R6
 	CBNZ	R6, droppedm
+
+	// Skip dropm to reuse it in the next call, when a pthread key has been created.
+	MOVD	_cgo_pthread_key_created(SB), R6
+	// It means cgo is disabled when _cgo_pthread_key_created is a nil pointer, need dropm.
+	CBZ	R6, dropm
+	MOVD	(R6), R6
+	CBNZ	R6, droppedm
+
+dropm:
 	MOVD	$runtime·dropm(SB), R0
 	BL	(R0)
 droppedm:
@@ -1161,10 +1261,6 @@ TEXT runtime·abort(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	ZR, R0
 	MOVD	(R0), R0
 	UNDEF
-
-TEXT runtime·return0(SB), NOSPLIT, $0
-	MOVW	$0, R0
-	RET
 
 // The top-most function running on a goroutine
 // returns to goexit+PCQuantum.
@@ -1478,71 +1574,23 @@ TEXT runtime·debugCallPanicked(SB),NOSPLIT,$16-16
 	BREAK
 	RET
 
-// Note: these functions use a special calling convention to save generated code space.
-// Arguments are passed in registers, but the space for those arguments are allocated
-// in the caller's stack frame. These stubs write the args into that stack space and
-// then tail call to the corresponding runtime handler.
-// The tail call makes these stubs disappear in backtraces.
-//
-// Defined as ABIInternal since the compiler generates ABIInternal
-// calls to it directly and it does not use the stack-based Go ABI.
-TEXT runtime·panicIndex<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicIndex<ABIInternal>(SB)
-TEXT runtime·panicIndexU<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicIndexU<ABIInternal>(SB)
-TEXT runtime·panicSliceAlen<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSliceAlen<ABIInternal>(SB)
-TEXT runtime·panicSliceAlenU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSliceAlenU<ABIInternal>(SB)
-TEXT runtime·panicSliceAcap<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSliceAcap<ABIInternal>(SB)
-TEXT runtime·panicSliceAcapU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSliceAcapU<ABIInternal>(SB)
-TEXT runtime·panicSliceB<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicSliceB<ABIInternal>(SB)
-TEXT runtime·panicSliceBU<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicSliceBU<ABIInternal>(SB)
-TEXT runtime·panicSlice3Alen<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R2, R0
-	MOVD	R3, R1
-	JMP	runtime·goPanicSlice3Alen<ABIInternal>(SB)
-TEXT runtime·panicSlice3AlenU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R2, R0
-	MOVD	R3, R1
-	JMP	runtime·goPanicSlice3AlenU<ABIInternal>(SB)
-TEXT runtime·panicSlice3Acap<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R2, R0
-	MOVD	R3, R1
-	JMP	runtime·goPanicSlice3Acap<ABIInternal>(SB)
-TEXT runtime·panicSlice3AcapU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R2, R0
-	MOVD	R3, R1
-	JMP	runtime·goPanicSlice3AcapU<ABIInternal>(SB)
-TEXT runtime·panicSlice3B<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSlice3B<ABIInternal>(SB)
-TEXT runtime·panicSlice3BU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R1, R0
-	MOVD	R2, R1
-	JMP	runtime·goPanicSlice3BU<ABIInternal>(SB)
-TEXT runtime·panicSlice3C<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicSlice3C<ABIInternal>(SB)
-TEXT runtime·panicSlice3CU<ABIInternal>(SB),NOSPLIT,$0-16
-	JMP	runtime·goPanicSlice3CU<ABIInternal>(SB)
-TEXT runtime·panicSliceConvert<ABIInternal>(SB),NOSPLIT,$0-16
-	MOVD	R2, R0
-	MOVD	R3, R1
-	JMP	runtime·goPanicSliceConvert<ABIInternal>(SB)
+TEXT runtime·panicBounds<ABIInternal>(SB),NOSPLIT,$144-0
+	NO_LOCAL_POINTERS
+	// Save all 16 int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	STP	(R0, R1), 24(RSP)
+	STP	(R2, R3), 40(RSP)
+	STP	(R4, R5), 56(RSP)
+	STP	(R6, R7), 72(RSP)
+	STP	(R8, R9), 88(RSP)
+	STP	(R10, R11), 104(RSP)
+	STP	(R12, R13), 120(RSP)
+	STP	(R14, R15), 136(RSP)
+	MOVD	LR, R0		// PC immediately after call to panicBounds
+	ADD	$24, RSP, R1	// pointer to save area
+	CALL	runtime·panicBounds64<ABIInternal>(SB)
+	RET
 
-TEXT ·getcallerfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT ·getfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
 	MOVD R29, R0
 	RET

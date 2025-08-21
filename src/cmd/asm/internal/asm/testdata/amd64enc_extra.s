@@ -1055,5 +1055,11 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$0
 	TPAUSE BX // 660faef3
 	UMONITOR BX // f30faef3
 	UMWAIT BX // f20faef3
+
+	RDPID DX                                // f30fc7fa
+	RDPID R11                               // f3410fc7fb
+
+	ENDBR64					// f30f1efa
+
 	// End of tests.
 	RET

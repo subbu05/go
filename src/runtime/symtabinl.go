@@ -4,9 +4,14 @@
 
 package runtime
 
+import (
+	"internal/abi"
+	_ "unsafe" // for linkname
+)
+
 // inlinedCall is the encoding of entries in the FUNCDATA_InlTree table.
 type inlinedCall struct {
-	funcID    funcID // type of the called function
+	funcID    abi.FuncID // type of the called function
 	_         [3]byte
 	nameOff   int32 // offset into pclntab for name of called function
 	parentPc  int32 // position of an instruction whose source position is the call site (offset from entry)
@@ -28,7 +33,6 @@ type inlinedCall struct {
 // code.
 type inlineUnwinder struct {
 	f       funcInfo
-	cache   *pcvalueCache
 	inlTree *[1 << 20]inlinedCall
 }
 
@@ -50,13 +54,23 @@ type inlineFrame struct {
 // This unwinder uses non-strict handling of PC because it's assumed this is
 // only ever used for symbolic debugging. If things go really wrong, it'll just
 // fall back to the outermost frame.
-func newInlineUnwinder(f funcInfo, pc uintptr, cache *pcvalueCache) (inlineUnwinder, inlineFrame) {
-	inldata := funcdata(f, _FUNCDATA_InlTree)
+//
+// newInlineUnwinder should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/phuslu/log
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname newInlineUnwinder
+func newInlineUnwinder(f funcInfo, pc uintptr) (inlineUnwinder, inlineFrame) {
+	inldata := funcdata(f, abi.FUNCDATA_InlTree)
 	if inldata == nil {
 		return inlineUnwinder{f: f}, inlineFrame{pc: pc, index: -1}
 	}
 	inlTree := (*[1 << 20]inlinedCall)(inldata)
-	u := inlineUnwinder{f: f, cache: cache, inlTree: inlTree}
+	u := inlineUnwinder{f: f, inlTree: inlTree}
 	return u, u.resolveInternal(pc)
 }
 
@@ -65,7 +79,7 @@ func (u *inlineUnwinder) resolveInternal(pc uintptr) inlineFrame {
 		pc: pc,
 		// Conveniently, this returns -1 if there's an error, which is the same
 		// value we use for the outermost frame.
-		index: pcdatavalue1(u.f, _PCDATA_InlTreeIndex, pc, u.cache, false),
+		index: pcdatavalue1(u.f, abi.PCDATA_InlTreeIndex, pc, false),
 	}
 }
 
@@ -89,6 +103,16 @@ func (u *inlineUnwinder) isInlined(uf inlineFrame) bool {
 }
 
 // srcFunc returns the srcFunc representing the given frame.
+//
+// srcFunc should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/phuslu/log
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+// The go:linkname is below.
 func (u *inlineUnwinder) srcFunc(uf inlineFrame) srcFunc {
 	if uf.index < 0 {
 		return u.f.srcFunc()
@@ -101,6 +125,9 @@ func (u *inlineUnwinder) srcFunc(uf inlineFrame) srcFunc {
 		t.funcID,
 	}
 }
+
+//go:linkname badSrcFunc runtime.(*inlineUnwinder).srcFunc
+func badSrcFunc(*inlineUnwinder, inlineFrame) srcFunc
 
 // fileLine returns the file name and line number of the call within the given
 // frame. As a convenience, for the innermost frame, it returns the file and

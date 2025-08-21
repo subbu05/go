@@ -10,7 +10,9 @@ import (
 	"unsafe"
 )
 
-type mOS struct{}
+type mOS struct {
+	waitsema uint32 // semaphore for parking on locks
+}
 
 //go:noescape
 func thr_new(param *thrparam, size int32) int32
@@ -48,7 +50,9 @@ func kqueue() int32
 func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32
 
 func pipe2(flags int32) (r, w int32, errno int32)
-func closeonexec(fd int32)
+func fcntl(fd, cmd, arg int32) (ret int32, errno int32)
+
+func issetugid() int32
 
 // From FreeBSD's <sys/sysctl.h>
 const (
@@ -87,7 +91,7 @@ const (
 func cpuset_getaffinity(level int, which int, id int64, size int, mask *byte) int32
 
 //go:systemstack
-func getncpu() int32 {
+func getCPUCount() int32 {
 	// Use a large buffer for the CPU mask. We're on the system
 	// stack, so this is fine, and we can't allocate memory for a
 	// dynamically-sized buffer at this point.
@@ -229,7 +233,7 @@ func newosproc(mp *m) {
 //
 //go:nosplit
 func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
-	stack := sysAlloc(stacksize, &memstats.stacks_sys)
+	stack := sysAlloc(stacksize, &memstats.stacks_sys, "OS thread stack")
 	if stack == nil {
 		writeErrStr(failallocatestack)
 		exit(1)
@@ -272,7 +276,7 @@ func libpreinit() {
 }
 
 func osinit() {
-	ncpu = getncpu()
+	numCPUStartup = getCPUCount()
 	if physPageSize == 0 {
 		physPageSize = getPageSize()
 	}
@@ -281,11 +285,11 @@ func osinit() {
 var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
-func getRandomData(r []byte) {
+func readRandom(r []byte) int {
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
 	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	closefd(fd)
-	extendRandom(r, int(n))
+	return int(n)
 }
 
 func goenvs() {
@@ -326,6 +330,7 @@ func minit() {
 //go:nosplit
 func unminit() {
 	unminitSignals()
+	getg().m.procid = 0
 }
 
 // Called from exitm, but not from drop, to undo the effect of thread-owned
@@ -417,6 +422,7 @@ func sysargs(argc int32, argv **byte) {
 const (
 	_AT_NULL     = 0  // Terminates the vector
 	_AT_PAGESZ   = 6  // Page size in bytes
+	_AT_PLATFORM = 15 // string identifying platform
 	_AT_TIMEKEEP = 22 // Pointer to timehands.
 	_AT_HWCAP    = 25 // CPU feature flags
 	_AT_HWCAP2   = 26 // CPU feature flags 2

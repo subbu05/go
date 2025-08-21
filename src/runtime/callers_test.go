@@ -5,8 +5,8 @@
 package runtime_test
 
 import (
-	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -80,7 +80,7 @@ func testCallersEqual(t *testing.T, pcs []uintptr, want []string) {
 		}
 		got = append(got, frame.Function)
 	}
-	if !reflect.DeepEqual(want, got) {
+	if !slices.Equal(want, got) {
 		t.Fatalf("wanted %v, got %v", want, got)
 	}
 }
@@ -443,10 +443,47 @@ func fpCallersCached(b *testing.B, n int) int {
 		pcs := make([]uintptr, 32)
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			runtime.FPCallers(0, pcs)
+			runtime.FPCallers(pcs)
 		}
 		b.StopTimer()
 		return 0
 	}
 	return 1 + fpCallersCached(b, n-1)
+}
+
+func TestFPUnwindAfterRecovery(t *testing.T) {
+	if !runtime.FramePointerEnabled {
+		t.Skip("frame pointers not supported for this architecture")
+	}
+	// Make sure that frame pointer unwinding succeeds from a deferred
+	// function run after recovering from a panic. It can fail if the
+	// recovery does not properly restore the caller's frame pointer before
+	// running the remaining deferred functions.
+	//
+	// This test does not verify the accuracy of the call stack (it
+	// currently includes a frame from runtime.deferreturn which would
+	// normally be omitted). It is only intended to check that producing the
+	// call stack won't crash.
+	defer func() {
+		pcs := make([]uintptr, 32)
+		for i := range pcs {
+			// If runtime.recovery doesn't properly restore the
+			// frame pointer before returning control to this
+			// function, it will point somewhere lower in the stack
+			// from one of the frames of runtime.gopanic() or one of
+			// it's callees prior to recovery.  So, we put some
+			// non-zero values on the stack to ensure that frame
+			// pointer unwinding will crash if it sees the old,
+			// invalid frame pointer.
+			pcs[i] = 10
+		}
+		runtime.FPCallers(pcs)
+		t.Logf("%v", pcs)
+	}()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("did not recover from panic")
+		}
+	}()
+	panic(1)
 }

@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/textproto"
 	"os"
+	"strconv"
 )
 
 // ErrMessageTooLarge is returned by ReadForm if the message form
@@ -26,13 +27,16 @@ var ErrMessageTooLarge = errors.New("multipart: message too large")
 // It stores up to maxMemory bytes + 10MB (reserved for non-file parts)
 // in memory. File parts which can't be stored in memory will be stored on
 // disk in temporary files.
-// It returns ErrMessageTooLarge if all non-file parts can't be stored in
+// It returns [ErrMessageTooLarge] if all non-file parts can't be stored in
 // memory.
 func (r *Reader) ReadForm(maxMemory int64) (*Form, error) {
 	return r.readForm(maxMemory)
 }
 
-var multipartFiles = godebug.New("multipartfiles")
+var (
+	multipartfiles    = godebug.New("#multipartfiles") // TODO: document and remove #
+	multipartmaxparts = godebug.New("multipartmaxparts")
+)
 
 func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 	form := &Form{make(map[string][]string), make(map[string][]*FileHeader)}
@@ -41,7 +45,20 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 		fileOff int64
 	)
 	numDiskFiles := 0
-	combineFiles := multipartFiles.Value() != "distinct"
+	combineFiles := true
+	if multipartfiles.Value() == "distinct" {
+		combineFiles = false
+		// multipartfiles.IncNonDefault() // TODO: uncomment after documenting
+	}
+	maxParts := 1000
+	if s := multipartmaxparts.Value(); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			maxParts = v
+			multipartmaxparts.IncNonDefault()
+		}
+	}
+	maxHeaders := maxMIMEHeaders()
+
 	defer func() {
 		if file != nil {
 			if cerr := file.Close(); err == nil {
@@ -69,7 +86,7 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 	// since metadata is always stored in memory, not disk.
 	//
 	// maxMemoryBytes is the maximum bytes we will store in memory, including file content,
-	// non-file part values, metdata, and map entry overhead.
+	// non-file part values, metadata, and map entry overhead.
 	//
 	// We reserve an additional 10 MB in maxMemoryBytes for non-file data.
 	//
@@ -88,14 +105,19 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 			maxMemoryBytes = math.MaxInt64
 		}
 	}
+	var copyBuf []byte
 	for {
-		p, err := r.nextPart(false, maxMemoryBytes)
+		p, err := r.nextPart(false, maxMemoryBytes, maxHeaders)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
+		if maxParts <= 0 {
+			return nil, ErrMessageTooLarge
+		}
+		maxParts--
 
 		name := p.FormName()
 		if name == "" {
@@ -106,8 +128,9 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 		// Multiple values for the same key (one map entry, longer slice) are cheaper
 		// than the same number of values for different keys (many map entries), but
 		// using a consistent per-value cost for overhead is simpler.
+		const mapEntryOverhead = 200
 		maxMemoryBytes -= int64(len(name))
-		maxMemoryBytes -= 100 // map overhead
+		maxMemoryBytes -= mapEntryOverhead
 		if maxMemoryBytes < 0 {
 			// We can't actually take this path, since nextPart would already have
 			// rejected the MIME headers for being too large. Check anyway.
@@ -131,9 +154,15 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 		}
 
 		// file, store in memory or on disk
+		const fileHeaderSize = 100
 		maxMemoryBytes -= mimeHeaderSize(p.Header)
+		maxMemoryBytes -= mapEntryOverhead
+		maxMemoryBytes -= fileHeaderSize
 		if maxMemoryBytes < 0 {
 			return nil, ErrMessageTooLarge
+		}
+		for _, v := range p.Header {
+			maxHeaders -= int64(len(v))
 		}
 		fh := &FileHeader{
 			Filename: filename,
@@ -151,14 +180,22 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 				}
 			}
 			numDiskFiles++
-			size, err := io.Copy(file, io.MultiReader(&b, p))
+			if _, err := file.Write(b.Bytes()); err != nil {
+				return nil, err
+			}
+			if copyBuf == nil {
+				copyBuf = make([]byte, 32*1024) // same buffer size as io.Copy uses
+			}
+			// os.File.ReadFrom will allocate its own copy buffer if we let io.Copy use it.
+			type writerOnly struct{ io.Writer }
+			remainingSize, err := io.CopyBuffer(writerOnly{file}, p, copyBuf)
 			if err != nil {
 				return nil, err
 			}
 			fh.tmpfile = file.Name()
-			fh.Size = size
+			fh.Size = int64(b.Len()) + remainingSize
 			fh.tmpoff = fileOff
-			fileOff += size
+			fileOff += fh.Size
 			if !combineFiles {
 				if err := file.Close(); err != nil {
 					return nil, err
@@ -178,9 +215,10 @@ func (r *Reader) readForm(maxMemory int64) (_ *Form, err error) {
 }
 
 func mimeHeaderSize(h textproto.MIMEHeader) (size int64) {
+	size = 400
 	for k, vs := range h {
 		size += int64(len(k))
-		size += 100 // map entry overhead
+		size += 200 // map entry overhead
 		for _, v := range vs {
 			size += int64(len(v))
 		}
@@ -190,7 +228,7 @@ func mimeHeaderSize(h textproto.MIMEHeader) (size int64) {
 
 // Form is a parsed multipart form.
 // Its File parts are stored either in memory or on disk,
-// and are accessible via the *FileHeader's Open method.
+// and are accessible via the [*FileHeader]'s Open method.
 // Its Value parts are stored as strings.
 // Both are keyed by field name.
 type Form struct {
@@ -198,7 +236,7 @@ type Form struct {
 	File  map[string][]*FileHeader
 }
 
-// RemoveAll removes any temporary files associated with a Form.
+// RemoveAll removes any temporary files associated with a [Form].
 func (f *Form) RemoveAll() error {
 	var err error
 	for _, fhs := range f.File {
@@ -226,7 +264,7 @@ type FileHeader struct {
 	tmpshared bool
 }
 
-// Open opens and returns the FileHeader's associated File.
+// Open opens and returns the [FileHeader]'s associated File.
 func (fh *FileHeader) Open() (File, error) {
 	if b := fh.content; b != nil {
 		r := io.NewSectionReader(bytes.NewReader(b), 0, int64(len(b)))

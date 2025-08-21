@@ -6,11 +6,11 @@ package ssa
 
 import (
 	"cmd/compile/internal/abi"
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/src"
-	"internal/buildcfg"
 )
 
 // A Config holds readonly compilation information.
@@ -36,20 +36,28 @@ type Config struct {
 	floatParamRegs []int8         // register numbers of floating param (in/out) registers
 	ABI1           *abi.ABIConfig // "ABIInternal" under development // TODO change comment when this becomes current
 	ABI0           *abi.ABIConfig
-	GCRegMap       []*Register // garbage collector register map, by GC register index
-	FPReg          int8        // register number of frame pointer, -1 if not used
-	LinkReg        int8        // register number of link register if it is a general purpose register, -1 if not used
-	hasGReg        bool        // has hardware g register
-	ctxt           *obj.Link   // Generic arch information
-	optimize       bool        // Do optimization
-	noDuffDevice   bool        // Don't use Duff's device
-	useSSE         bool        // Use SSE for non-float operations
-	useAvg         bool        // Use optimizations that need Avg* operations
-	useHmul        bool        // Use optimizations that need Hmul* operations
-	SoftFloat      bool        //
-	Race           bool        // race detector enabled
-	BigEndian      bool        //
-	UseFMA         bool        // Use hardware FMA operation
+	FPReg          int8      // register number of frame pointer, -1 if not used
+	LinkReg        int8      // register number of link register if it is a general purpose register, -1 if not used
+	hasGReg        bool      // has hardware g register
+	ctxt           *obj.Link // Generic arch information
+	optimize       bool      // Do optimization
+	useAvg         bool      // Use optimizations that need Avg* operations
+	useHmul        bool      // Use optimizations that need Hmul* operations
+	SoftFloat      bool      //
+	Race           bool      // race detector enabled
+	BigEndian      bool      //
+	unalignedOK    bool      // Unaligned loads/stores are ok
+	haveBswap64    bool      // architecture implements Bswap64
+	haveBswap32    bool      // architecture implements Bswap32
+	haveBswap16    bool      // architecture implements Bswap16
+
+	// mulRecipes[x] = function to build v * x from v.
+	mulRecipes map[int64]mulRecipe
+}
+
+type mulRecipe struct {
+	cost  int
+	build func(*Value, *Value) *Value // build(m, v) returns v * x built at m.
 }
 
 type (
@@ -125,7 +133,7 @@ type Logger interface {
 	// some logging calls account for more than a few heap allocations.
 	Log() bool
 
-	// Fatal reports a compiler error and exits.
+	// Fatalf reports a compiler error and exits.
 	Fatalf(pos src.XPos, msg string, args ...interface{})
 
 	// Warnl writes compiler messages in the form expected by "errorcheck" tests
@@ -136,26 +144,14 @@ type Logger interface {
 }
 
 type Frontend interface {
-	CanSSA(t *types.Type) bool
-
 	Logger
 
 	// StringData returns a symbol pointing to the given string's contents.
 	StringData(string) *obj.LSym
 
-	// Auto returns a Node for an auto variable of the given type.
-	// The SSA compiler uses this function to allocate space for spills.
-	Auto(src.XPos, *types.Type) *ir.Name
-
 	// Given the name for a compound type, returns the name we should use
 	// for the parts of that compound type.
 	SplitSlot(parent *LocalSlot, suffix string, offset int64, t *types.Type) LocalSlot
-
-	// Line returns a string describing the given position.
-	Line(src.XPos) string
-
-	// AllocFrame assigns frame offsets to all live auto variables.
-	AllocFrame(f *Func)
 
 	// Syslook returns a symbol of the runtime function/variable with the
 	// given name.
@@ -164,15 +160,8 @@ type Frontend interface {
 	// UseWriteBarrier reports whether write barrier is enabled
 	UseWriteBarrier() bool
 
-	// SetWBPos indicates that a write barrier has been inserted
-	// in this function at position pos.
-	SetWBPos(pos src.XPos)
-
-	// MyImportPath provides the import name (roughly, the package) for the function being compiled.
-	MyImportPath() string
-
-	// LSym returns the linker symbol of the function being compiled.
-	LSym() string
+	// Func returns the ir.Func of the function being compiled.
+	Func() *ir.Func
 }
 
 // NewConfig returns a new configuration object for the given architecture.
@@ -198,6 +187,10 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegAMD64
 		c.LinkReg = linkRegAMD64
 		c.hasGReg = true
+		c.unalignedOK = true
+		c.haveBswap64 = true
+		c.haveBswap32 = true
+		c.haveBswap16 = true
 	case "386":
 		c.PtrSize = 4
 		c.RegSize = 4
@@ -210,6 +203,9 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerReg386
 		c.LinkReg = linkReg386
 		c.hasGReg = false
+		c.unalignedOK = true
+		c.haveBswap32 = true
+		c.haveBswap16 = true
 	case "arm":
 		c.PtrSize = 4
 		c.RegSize = 4
@@ -236,6 +232,10 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegARM64
 		c.LinkReg = linkRegARM64
 		c.hasGReg = true
+		c.unalignedOK = true
+		c.haveBswap64 = true
+		c.haveBswap32 = true
+		c.haveBswap16 = true
 	case "ppc64":
 		c.BigEndian = true
 		fallthrough
@@ -255,6 +255,14 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegPPC64
 		c.LinkReg = linkRegPPC64
 		c.hasGReg = true
+		c.unalignedOK = true
+		// Note: ppc64 has register bswap ops only when GOPPC64>=10.
+		// But it has bswap+load and bswap+store ops for all ppc64 variants.
+		// That is the sense we're using them here - they are only used
+		// in contexts where they can be merged with a load or store.
+		c.haveBswap64 = true
+		c.haveBswap32 = true
+		c.haveBswap16 = true
 	case "mips64":
 		c.BigEndian = true
 		fallthrough
@@ -275,12 +283,17 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.RegSize = 8
 		c.lowerBlock = rewriteBlockLOONG64
 		c.lowerValue = rewriteValueLOONG64
+		c.lateLowerBlock = rewriteBlockLOONG64latelower
+		c.lateLowerValue = rewriteValueLOONG64latelower
 		c.registers = registersLOONG64[:]
 		c.gpRegMask = gpRegMaskLOONG64
 		c.fpRegMask = fpRegMaskLOONG64
+		c.intParamRegs = paramIntRegLOONG64
+		c.floatParamRegs = paramFloatRegLOONG64
 		c.FPReg = framepointerRegLOONG64
 		c.LinkReg = linkRegLOONG64
 		c.hasGReg = true
+		c.unalignedOK = true
 	case "s390x":
 		c.PtrSize = 8
 		c.RegSize = 8
@@ -292,8 +305,11 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegS390X
 		c.LinkReg = linkRegS390X
 		c.hasGReg = true
-		c.noDuffDevice = true
 		c.BigEndian = true
+		c.unalignedOK = true
+		c.haveBswap64 = true
+		c.haveBswap32 = true
+		c.haveBswap16 = true // only for loads&stores, see ppc64 comment
 	case "mips":
 		c.BigEndian = true
 		fallthrough
@@ -309,7 +325,6 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegMIPS
 		c.LinkReg = linkRegMIPS
 		c.hasGReg = true
-		c.noDuffDevice = true
 	case "riscv64":
 		c.PtrSize = 8
 		c.RegSize = 8
@@ -337,7 +352,6 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		c.FPReg = framepointerRegWasm
 		c.LinkReg = linkRegWasm
 		c.hasGReg = true
-		c.noDuffDevice = true
 		c.useAvg = false
 		c.useHmul = false
 	default:
@@ -345,27 +359,13 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 	}
 	c.ctxt = ctxt
 	c.optimize = optimize
-	c.useSSE = true
-	c.UseFMA = true
 	c.SoftFloat = softfloat
 	if softfloat {
 		c.floatParamRegs = nil // no FP registers in softfloat mode
 	}
 
-	c.ABI0 = abi.NewABIConfig(0, 0, ctxt.Arch.FixedFrameSize)
-	c.ABI1 = abi.NewABIConfig(len(c.intParamRegs), len(c.floatParamRegs), ctxt.Arch.FixedFrameSize)
-
-	// On Plan 9, floating point operations are not allowed in note handler.
-	if buildcfg.GOOS == "plan9" {
-		// Don't use FMA on Plan 9
-		c.UseFMA = false
-
-		// Don't use Duff's device and SSE on Plan 9 AMD64.
-		if arch == "amd64" {
-			c.noDuffDevice = true
-			c.useSSE = false
-		}
-	}
+	c.ABI0 = abi.NewABIConfig(0, 0, ctxt.Arch.FixedFrameSize, 0)
+	c.ABI1 = abi.NewABIConfig(len(c.intParamRegs), len(c.floatParamRegs), ctxt.Arch.FixedFrameSize, 1)
 
 	if ctxt.Flag_shared {
 		// LoweredWB is secretly a CALL and CALLs on 386 in
@@ -374,22 +374,360 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize, softfloat boo
 		opcodeTable[Op386LoweredWB].reg.clobbers |= 1 << 3 // BX
 	}
 
-	// Create the GC register map index.
-	// TODO: This is only used for debug printing. Maybe export config.registers?
-	gcRegMapSize := int16(0)
-	for _, r := range c.registers {
-		if r.gcNum+1 > gcRegMapSize {
-			gcRegMapSize = r.gcNum + 1
-		}
-	}
-	c.GCRegMap = make([]*Register, gcRegMapSize)
-	for i, r := range c.registers {
-		if r.gcNum != -1 {
-			c.GCRegMap[r.gcNum] = &c.registers[i]
-		}
-	}
+	c.buildRecipes(arch)
 
 	return c
 }
 
 func (c *Config) Ctxt() *obj.Link { return c.ctxt }
+
+func (c *Config) haveByteSwap(size int64) bool {
+	switch size {
+	case 8:
+		return c.haveBswap64
+	case 4:
+		return c.haveBswap32
+	case 2:
+		return c.haveBswap16
+	default:
+		base.Fatalf("bad size %d\n", size)
+		return false
+	}
+}
+
+func (c *Config) buildRecipes(arch string) {
+	// Information for strength-reducing multiplies.
+	type linearCombo struct {
+		// we can compute a*x+b*y in one instruction
+		a, b int64
+		// cost, in arbitrary units (tenths of cycles, usually)
+		cost int
+		// builds SSA value for a*x+b*y. Use the position
+		// information from m.
+		build func(m, x, y *Value) *Value
+	}
+
+	// List all the linear combination instructions we have.
+	var linearCombos []linearCombo
+	r := func(a, b int64, cost int, build func(m, x, y *Value) *Value) {
+		linearCombos = append(linearCombos, linearCombo{a: a, b: b, cost: cost, build: build})
+	}
+	var mulCost int
+	switch arch {
+	case "amd64":
+		// Assumes that the following costs from https://gmplib.org/~tege/x86-timing.pdf:
+		//    1 - addq, shlq, leaq, negq, subq
+		//    3 - imulq
+		// These costs limit the rewrites to two instructions.
+		// Operations which have to happen in place (and thus
+		// may require a reg-reg move) score slightly higher.
+		mulCost = 30
+		// add
+		r(1, 1, 10,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue2(m.Pos, OpAMD64ADDQ, m.Type, x, y)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64ADDL
+				}
+				return v
+			})
+		// neg
+		r(-1, 0, 11,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue1(m.Pos, OpAMD64NEGQ, m.Type, x)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64NEGL
+				}
+				return v
+			})
+		// sub
+		r(1, -1, 11,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue2(m.Pos, OpAMD64SUBQ, m.Type, x, y)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64SUBL
+				}
+				return v
+			})
+		// lea
+		r(1, 2, 10,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue2(m.Pos, OpAMD64LEAQ2, m.Type, x, y)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64LEAL2
+				}
+				return v
+			})
+		r(1, 4, 10,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue2(m.Pos, OpAMD64LEAQ4, m.Type, x, y)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64LEAL4
+				}
+				return v
+			})
+		r(1, 8, 10,
+			func(m, x, y *Value) *Value {
+				v := m.Block.NewValue2(m.Pos, OpAMD64LEAQ8, m.Type, x, y)
+				if m.Type.Size() == 4 {
+					v.Op = OpAMD64LEAL8
+				}
+				return v
+			})
+		// regular shifts
+		for i := 2; i < 64; i++ {
+			r(1<<i, 0, 11,
+				func(m, x, y *Value) *Value {
+					v := m.Block.NewValue1I(m.Pos, OpAMD64SHLQconst, m.Type, int64(i), x)
+					if m.Type.Size() == 4 {
+						v.Op = OpAMD64SHLLconst
+					}
+					return v
+				})
+		}
+
+	case "arm64":
+		// Rationale (for M2 ultra):
+		// - multiply is 3 cycles.
+		// - add/neg/sub/shift are 1 cycle.
+		// - add/neg/sub+shiftLL are 2 cycles.
+		// We break ties against the multiply because using a
+		// multiply also needs to load the constant into a register.
+		// (It's 3 cycles and 2 instructions either way, but the
+		// linear combo one might use 1 less register.)
+		// The multiply constant might get lifted out of a loop though. Hmm....
+		// Other arm64 chips have different tradeoffs.
+		// Some chip's add+shift instructions are 1 cycle for shifts up to 4
+		// and 2 cycles for shifts bigger than 4. So weight the larger shifts
+		// a bit more.
+		// TODO: figure out a happy medium.
+		mulCost = 35
+		// add
+		r(1, 1, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue2(m.Pos, OpARM64ADD, m.Type, x, y)
+			})
+		// neg
+		r(-1, 0, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue1(m.Pos, OpARM64NEG, m.Type, x)
+			})
+		// sub
+		r(1, -1, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue2(m.Pos, OpARM64SUB, m.Type, x, y)
+			})
+		// regular shifts
+		for i := 1; i < 64; i++ {
+			c := 10
+			if i == 1 {
+				// Prefer x<<1 over x+x.
+				// Note that we eventually reverse this decision in ARM64latelower.rules,
+				// but this makes shift combining rules in ARM64.rules simpler.
+				c--
+			}
+			r(1<<i, 0, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue1I(m.Pos, OpARM64SLLconst, m.Type, int64(i), x)
+				})
+		}
+		// ADDshiftLL
+		for i := 1; i < 64; i++ {
+			c := 20
+			if i > 4 {
+				c++
+			}
+			r(1, 1<<i, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue2I(m.Pos, OpARM64ADDshiftLL, m.Type, int64(i), x, y)
+				})
+		}
+		// NEGshiftLL
+		for i := 1; i < 64; i++ {
+			c := 20
+			if i > 4 {
+				c++
+			}
+			r(-1<<i, 0, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue1I(m.Pos, OpARM64NEGshiftLL, m.Type, int64(i), x)
+				})
+		}
+		// SUBshiftLL
+		for i := 1; i < 64; i++ {
+			c := 20
+			if i > 4 {
+				c++
+			}
+			r(1, -1<<i, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue2I(m.Pos, OpARM64SUBshiftLL, m.Type, int64(i), x, y)
+				})
+		}
+	case "loong64":
+		// - multiply is 4 cycles.
+		// - add/sub/shift/alsl are 1 cycle.
+		// On loong64, using a multiply also needs to load the constant into a register.
+		// TODO: figure out a happy medium.
+		mulCost = 45
+
+		// add
+		r(1, 1, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue2(m.Pos, OpLOONG64ADDV, m.Type, x, y)
+			})
+		// neg
+		r(-1, 0, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue1(m.Pos, OpLOONG64NEGV, m.Type, x)
+			})
+		// sub
+		r(1, -1, 10,
+			func(m, x, y *Value) *Value {
+				return m.Block.NewValue2(m.Pos, OpLOONG64SUBV, m.Type, x, y)
+			})
+
+		// regular shifts
+		for i := 1; i < 64; i++ {
+			c := 10
+			if i == 1 {
+				// Prefer x<<1 over x+x.
+				// Note that we eventually reverse this decision in LOONG64latelower.rules,
+				// but this makes shift combining rules in LOONG64.rules simpler.
+				c--
+			}
+			r(1<<i, 0, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue1I(m.Pos, OpLOONG64SLLVconst, m.Type, int64(i), x)
+				})
+		}
+
+		// ADDshiftLLV
+		for i := 1; i < 5; i++ {
+			c := 10
+			r(1, 1<<i, c,
+				func(m, x, y *Value) *Value {
+					return m.Block.NewValue2I(m.Pos, OpLOONG64ADDshiftLLV, m.Type, int64(i), x, y)
+				})
+		}
+	}
+
+	c.mulRecipes = map[int64]mulRecipe{}
+
+	// Single-instruction recipes.
+	// The only option for the input value(s) is v.
+	for _, combo := range linearCombos {
+		x := combo.a + combo.b
+		cost := combo.cost
+		old := c.mulRecipes[x]
+		if (old.build == nil || cost < old.cost) && cost < mulCost {
+			c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+				return combo.build(m, v, v)
+			}}
+		}
+	}
+	// Two-instruction recipes.
+	// A: Both of the outer's inputs are from the same single-instruction recipe.
+	// B: First input is v and the second is from a single-instruction recipe.
+	// C: Second input is v and the first is from a single-instruction recipe.
+	// A is slightly preferred because it often needs 1 less register, so it
+	// goes first.
+
+	// A
+	for _, inner := range linearCombos {
+		for _, outer := range linearCombos {
+			x := (inner.a + inner.b) * (outer.a + outer.b)
+			cost := inner.cost + outer.cost
+			old := c.mulRecipes[x]
+			if (old.build == nil || cost < old.cost) && cost < mulCost {
+				c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+					v = inner.build(m, v, v)
+					return outer.build(m, v, v)
+				}}
+			}
+		}
+	}
+
+	// B
+	for _, inner := range linearCombos {
+		for _, outer := range linearCombos {
+			x := outer.a + outer.b*(inner.a+inner.b)
+			cost := inner.cost + outer.cost
+			old := c.mulRecipes[x]
+			if (old.build == nil || cost < old.cost) && cost < mulCost {
+				c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+					return outer.build(m, v, inner.build(m, v, v))
+				}}
+			}
+		}
+	}
+
+	// C
+	for _, inner := range linearCombos {
+		for _, outer := range linearCombos {
+			x := outer.a*(inner.a+inner.b) + outer.b
+			cost := inner.cost + outer.cost
+			old := c.mulRecipes[x]
+			if (old.build == nil || cost < old.cost) && cost < mulCost {
+				c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+					return outer.build(m, inner.build(m, v, v), v)
+				}}
+			}
+		}
+	}
+
+	// Currently we only process 3 linear combination instructions for loong64.
+	if arch == "loong64" {
+		// Three-instruction recipes.
+		// D: The first and the second are all single-instruction recipes, and they are also the third's inputs.
+		// E: The first single-instruction is the second's input, and the second is the third's input.
+
+		// D
+		for _, first := range linearCombos {
+			for _, second := range linearCombos {
+				for _, third := range linearCombos {
+					x := third.a*(first.a+first.b) + third.b*(second.a+second.b)
+					cost := first.cost + second.cost + third.cost
+					old := c.mulRecipes[x]
+					if (old.build == nil || cost < old.cost) && cost < mulCost {
+						c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+							v1 := first.build(m, v, v)
+							v2 := second.build(m, v, v)
+							return third.build(m, v1, v2)
+						}}
+					}
+				}
+			}
+		}
+
+		// E
+		for _, first := range linearCombos {
+			for _, second := range linearCombos {
+				for _, third := range linearCombos {
+					x := third.a*(second.a*(first.a+first.b)+second.b) + third.b
+					cost := first.cost + second.cost + third.cost
+					old := c.mulRecipes[x]
+					if (old.build == nil || cost < old.cost) && cost < mulCost {
+						c.mulRecipes[x] = mulRecipe{cost: cost, build: func(m, v *Value) *Value {
+							v1 := first.build(m, v, v)
+							v2 := second.build(m, v1, v)
+							return third.build(m, v2, v)
+						}}
+					}
+				}
+			}
+		}
+	}
+
+	// These cases should be handled specially by rewrite rules.
+	// (Otherwise v * 1 == (neg (neg v)))
+	delete(c.mulRecipes, 0)
+	delete(c.mulRecipes, 1)
+
+	// Currently:
+	// len(c.mulRecipes) == 5984 on arm64
+	//                       680 on amd64
+	//                      9738 on loong64
+	// This function takes ~2.5ms on arm64.
+	//println(len(c.mulRecipes))
+}

@@ -105,7 +105,7 @@ TEXT runtime·tstart_sysvicall(SB),NOSPLIT,$0
 	MOVQ	AX, (g_stack+stack_hi)(DX)
 	SUBQ	$(0x100000), AX		// stack size
 	MOVQ	AX, (g_stack+stack_lo)(DX)
-	ADDQ	$const__StackGuard, AX
+	ADDQ	$const_stackGuard, AX
 	MOVQ	AX, g_stackguard0(DX)
 	MOVQ	AX, g_stackguard1(DX)
 
@@ -155,7 +155,7 @@ allgood:
 
 	// save m->libcall
 	MOVQ	g_m(R10), BP
-	LEAQ	m_libcall(BP), R11
+	LEAQ	(m_mOS+mOS_libcall)(BP), R11
 	MOVQ	libcall_fn(R11), R10
 	MOVQ	R10, 72(SP)
 	MOVQ	libcall_args(R11), R10
@@ -197,7 +197,7 @@ allgood:
 	MOVQ	g(BX), BP
 	MOVQ	g_m(BP), BP
 	// restore libcall
-	LEAQ	m_libcall(BP), R11
+	LEAQ	(m_mOS+mOS_libcall)(BP), R11
 	MOVQ	72(SP), R10
 	MOVQ	R10, libcall_fn(R11)
 	MOVQ	80(SP), R10
